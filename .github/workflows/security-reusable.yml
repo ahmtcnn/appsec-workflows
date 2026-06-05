@@ -308,18 +308,24 @@ jobs:
           echo "found=true" >> $GITHUB_OUTPUT
           docker build -f "$DF" -t local/app:test "$(dirname "$DF")"
 
-      - name: Uygulamayı başlat
+      - name: Uygulamayı başlat ve hazır olmasını bekle
         if: steps.df.outputs.found == 'true' && inputs.dast_start_command != ''
         run: |
           ${{ inputs.dast_start_command }}
-          echo "Uygulama başlatıldı, ${{ inputs.dast_wait_seconds }} sn bekleniyor..."
-          sleep ${{ inputs.dast_wait_seconds }}
-          # Hızlı sağlık kontrolü
-          curl -fsS --max-time 5 "${{ inputs.dast_target }}" || echo "uyarı: target henüz cevap vermiyor"
+          echo "Uygulama başlatıldı, ${{ inputs.dast_wait_seconds }} sn'ye kadar hazırlık bekleniyor..."
+          for i in $(seq 1 ${{ inputs.dast_wait_seconds }}); do
+            if curl -fsS --max-time 2 "${{ inputs.dast_target }}" > /dev/null 2>&1; then
+              echo "✅ Uygulama ${i}sn sonra hazır."
+              break
+            fi
+            sleep 1
+          done
+          echo "--- docker ps ---"; docker ps -a
+          echo "--- container logs ---"; docker ps -aq | head -1 | xargs -r docker logs 2>&1 | tail -30 || true
 
       - name: ZAP Baseline Scan
         if: steps.df.outputs.found == 'true'
-        uses: zaproxy/action-baseline@v0.13.0
+        uses: zaproxy/action-baseline@v0.15.0
         with:
           target: ${{ inputs.dast_target }}
           cmd_options: '-a -j -T 5'
