@@ -139,13 +139,11 @@ jobs:
           echo "| 🔵 Low   | $LOW  |" >> $GITHUB_STEP_SUMMARY
           if [ $((HIGH + MED)) -gt 0 ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### İlk 20 bulgu" >> $GITHUB_STEP_SUMMARY
-            echo "| Sev | Kural | Konum |" >> $GITHUB_STEP_SUMMARY
-            echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+            echo "### Tüm bulgular (HIGH/MED)" >> $GITHUB_STEP_SUMMARY
             jq -r '.results[]
               | select(.extra.severity=="ERROR" or .extra.severity=="WARNING")
-              | "| \(.extra.severity) | `\(.check_id)` | `\(.path):\(.start.line)` |"' \
-              semgrep.json | head -20 >> $GITHUB_STEP_SUMMARY
+              | "<details><summary>🔴 **\(.extra.severity)** `\(.check_id)` — `\(.path):\(.start.line)`</summary>\n\n> \((.extra.message // "n/a") | gsub("\n"; " "))\n\n</details>\n"' \
+              semgrep.json >> $GITHUB_STEP_SUMMARY
           fi
 
       - uses: actions/upload-artifact@v4
@@ -168,6 +166,16 @@ jobs:
           curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${V}/trivy_${V}_Linux-64bit.tar.gz" \
             | sudo tar xz -C /usr/local/bin trivy
           trivy --version
+
+      - name: Generate Node lockfile if missing (so Trivy can scan)
+        run: |
+          for pj in $(find . -name package.json -not -path './node_modules/*' 2>/dev/null); do
+            dir=$(dirname "$pj")
+            if [ ! -f "$dir/package-lock.json" ] && [ ! -f "$dir/yarn.lock" ] && [ ! -f "$dir/pnpm-lock.yaml" ]; then
+              echo "[$dir] lockfile yok, üretiliyor..."
+              (cd "$dir" && npm install --package-lock-only --ignore-scripts --no-audit --no-fund 2>&1 | tail -5) || echo "[$dir] lockfile üretilemedi (devam)"
+            fi
+          done
 
       - name: Trivy fs scan
         run: |
@@ -348,6 +356,11 @@ jobs:
             echo "| 🔴 High   | $HIGH |" >> $GITHUB_STEP_SUMMARY
             echo "| 🟡 Medium | $MED  |" >> $GITHUB_STEP_SUMMARY
             echo "| 🔵 Low    | $LOW  |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Tüm uyarılar (detaylı)" >> $GITHUB_STEP_SUMMARY
+            jq -r '.site[]?.alerts[]?
+              | "<details><summary>**\(.riskdesc)** — \(.name) (×\(.count))</summary>\n\n\((.desc // "n/a") | gsub("<[^>]+>"; "") | gsub("\n"; " "))\n\n**Çözüm:** \((.solution // "n/a") | gsub("<[^>]+>"; "") | gsub("\n"; " "))\n\n</details>\n"' \
+              report_json.json >> $GITHUB_STEP_SUMMARY
             cp report_json.json zap.json
           else
             echo '{"site":[]}' > zap.json
@@ -431,33 +444,55 @@ jobs:
             REASON="Eşikler altında; kurum içi ortamda çalıştırılabilir."
           fi
 
+          # Top findings — DevOps tek bakışta görsün
+          TOP_SECRETS='[]'
+          TOP_SAST='[]'
+          TOP_SCA='[]'
+          TOP_IMG='[]'
+          TOP_DAST='[]'
+          [ -f scans/gitleaks.json ]    && TOP_SECRETS=$(jq '[.[] | {rule: .RuleID, file: .File, line: .StartLine}] | .[0:5]' scans/gitleaks.json)
+          [ -f scans/semgrep.json ]     && TOP_SAST=$(jq '[.results[] | select(.extra.severity=="ERROR") | {sev: .extra.severity, rule: .check_id, file: .path, line: .start.line, msg: (.extra.message | gsub("\n"; " ") | .[0:200])}] | .[0:5]' scans/semgrep.json)
+          [ -f scans/trivy-fs.json ]    && TOP_SCA=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH") | {sev: .Severity, pkg: .PkgName, version: .InstalledVersion, cve: .VulnerabilityID, fix: (.FixedVersion // "n/a")}] | unique | .[0:5]' scans/trivy-fs.json)
+          [ -f scans/trivy-image.json ] && TOP_IMG=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL") | {sev: .Severity, pkg: .PkgName, version: .InstalledVersion, cve: .VulnerabilityID, fix: (.FixedVersion // "n/a")}] | unique | .[0:5]' scans/trivy-image.json)
+          [ -f scans/zap.json ]         && TOP_DAST=$(jq '[.site[]?.alerts[]? | select(.riskcode=="2" or .riskcode=="3") | {risk: .riskdesc, name: .name, count: .count}] | .[0:5]' scans/zap.json)
+
           # JSON response — DevOps bunu okuyacak
-          cat > verdict.json <<EOF
-          {
-            "verdict": "$VERDICT",
-            "decision": "$DECISION",
-            "reason": "$REASON",
-            "commit": "${{ github.sha }}",
-            "repo": "${{ github.repository }}",
-            "ref": "${{ github.ref }}",
-            "actor": "${{ github.actor }}",
-            "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-            "thresholds": { "critical": $CTH, "high": $HTH },
-            "findings": {
-              "secrets":      $SECRETS,
-              "sast_high":    $SAST_H,
-              "sast_medium":  $SAST_M,
-              "sca_critical": $SCA_C,
-              "sca_high":     $SCA_H,
-              "image_critical": $IMG_C,
-              "image_high":   $IMG_H,
-              "dast_high":    $ZAP_H,
-              "dast_medium":  $ZAP_M,
-              "total_critical": $TOTAL_CRIT,
-              "total_high":   $TOTAL_HIGH
-            }
-          }
-          EOF
+          jq -n \
+            --arg verdict   "$VERDICT" \
+            --arg decision  "$DECISION" \
+            --arg reason    "$REASON" \
+            --arg commit    "${{ github.sha }}" \
+            --arg repo      "${{ github.repository }}" \
+            --arg ref       "${{ github.ref }}" \
+            --arg actor     "${{ github.actor }}" \
+            --arg run_url   "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson cth $CTH --argjson hth $HTH \
+            --argjson secrets $SECRETS --argjson sast_h $SAST_H --argjson sast_m $SAST_M \
+            --argjson sca_c $SCA_C --argjson sca_h $SCA_H \
+            --argjson img_c $IMG_C --argjson img_h $IMG_H \
+            --argjson zap_h $ZAP_H --argjson zap_m $ZAP_M \
+            --argjson tcrit $TOTAL_CRIT --argjson thigh $TOTAL_HIGH \
+            --argjson top_secrets "$TOP_SECRETS" \
+            --argjson top_sast "$TOP_SAST" \
+            --argjson top_sca "$TOP_SCA" \
+            --argjson top_img "$TOP_IMG" \
+            --argjson top_dast "$TOP_DAST" \
+            '{
+              verdict: $verdict, decision: $decision, reason: $reason,
+              commit: $commit, repo: $repo, ref: $ref, actor: $actor, run_url: $run_url,
+              thresholds: {critical: $cth, high: $hth},
+              findings: {
+                secrets: $secrets, sast_high: $sast_h, sast_medium: $sast_m,
+                sca_critical: $sca_c, sca_high: $sca_h,
+                image_critical: $img_c, image_high: $img_h,
+                dast_high: $zap_h, dast_medium: $zap_m,
+                total_critical: $tcrit, total_high: $thigh
+              },
+              top_findings: {
+                secrets: $top_secrets, sast: $top_sast,
+                sca: $top_sca, image: $top_img, dast: $top_dast
+              }
+            }' > verdict.json
 
           # Workflow outputs
           echo "verdict=$VERDICT"   >> $GITHUB_OUTPUT
@@ -501,7 +536,25 @@ jobs:
             echo "| 🔴 Toplam CRITICAL     | ${{ steps.score.outputs.total_crit }} |"
             echo "| 🟠 Toplam HIGH         | ${{ steps.score.outputs.total_high }} |"
             echo ""
-            echo "Detay: bu run'ın **Artifacts** kısmı + jobların **Summary** sekmeleri."
+            echo "### Top 5 bulgu (her kategoriden)"
+            echo ""
+            echo "<details><summary>🔐 Secrets</summary>"; echo ""
+            jq -r '.top_findings.secrets[] | "- `\(.rule)` → `\(.file):\(.line)`"' verdict.json
+            echo ""; echo "</details>"
+            echo "<details><summary>🔍 SAST</summary>"; echo ""
+            jq -r '.top_findings.sast[] | "- **\(.sev)** `\(.rule)` → `\(.file):\(.line)`\n  > \(.msg)"' verdict.json
+            echo ""; echo "</details>"
+            echo "<details><summary>📦 SCA</summary>"; echo ""
+            jq -r '.top_findings.sca[] | "- **\(.sev)** `\(.pkg)@\(.version)` → \(.cve) (fix: \(.fix))"' verdict.json
+            echo ""; echo "</details>"
+            echo "<details><summary>🐳 Container</summary>"; echo ""
+            jq -r '.top_findings.image[] | "- **\(.sev)** `\(.pkg)@\(.version)` → \(.cve) (fix: \(.fix))"' verdict.json
+            echo ""; echo "</details>"
+            echo "<details><summary>🌐 DAST</summary>"; echo ""
+            jq -r '.top_findings.dast[] | "- **\(.risk)** \(.name) (×\(.count))"' verdict.json
+            echo ""; echo "</details>"
+            echo ""
+            echo "Tam detay: bu run'ın **Artifacts** kısmı + jobların **Summary** sekmeleri."
           } >> $GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@v4
