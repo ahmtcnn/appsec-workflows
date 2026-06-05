@@ -1,0 +1,518 @@
+name: AppSec Security (Reusable)
+
+# Reusable workflow — sadece push'ta tetiklenir (caller tarafında).
+# Caller workflow:
+#   uses: <ORG>/appsec-workflows/.github/workflows/security-reusable.yml@main
+#   with:
+#     enable_dast: true
+#     dast_target: 'http://localhost:5000'
+#     dast_start_command: 'docker run -d -p 5000:5000 --name app local/app:test'
+#     dast_wait_seconds: 15
+
+on:
+  workflow_call:
+    inputs:
+      enable_container_scan:
+        description: 'Trivy ile docker image taraması'
+        type: boolean
+        default: true
+      enable_dast:
+        description: 'ZAP baseline DAST taraması'
+        type: boolean
+        default: false
+      dast_target:
+        description: 'DAST hedef URL (örn http://localhost:5000)'
+        type: string
+        default: 'http://localhost:5000'
+      dast_start_command:
+        description: 'Uygulamayı başlatan komut (docker run / docker compose up -d)'
+        type: string
+        default: ''
+      dast_wait_seconds:
+        description: 'Uygulamanın hazır olması için bekleme süresi'
+        type: number
+        default: 20
+      critical_threshold:
+        description: 'Bu sayının üzerinde CRITICAL bulgu → RED verdict'
+        type: number
+        default: 0
+      high_threshold:
+        description: 'Bu sayının üzerinde HIGH bulgu → YELLOW verdict'
+        type: number
+        default: 5
+      soft_fail:
+        description: 'true ise RED verdict workflow''u FAIL etmez (pilot mod)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  statuses: write   # commit status için
+  actions: read
+
+jobs:
+
+  # =====================================================================
+  # 1) Secret Scan — Gitleaks
+  # =====================================================================
+  secret-scan:
+    name: 🔐 Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Gitleaks
+        run: |
+          V=8.21.2
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Run Gitleaks
+        run: |
+          gitleaks detect \
+            --source . \
+            --report-format json \
+            --report-path gitleaks.json \
+            --exit-code 0 \
+            --redact \
+            --no-banner || true
+          # Boş dosya yoksa boş array yaz
+          [ -s gitleaks.json ] || echo "[]" > gitleaks.json
+
+      - name: Job Summary
+        run: |
+          COUNT=$(jq 'length' gitleaks.json)
+          echo "## 🔐 Secret Scan (Gitleaks)" >> $GITHUB_STEP_SUMMARY
+          echo "**Bulgu:** $COUNT" >> $GITHUB_STEP_SUMMARY
+          if [ "$COUNT" -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Kural | Dosya | Satır |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+            jq -r '.[] | "| \(.RuleID) | `\(.File)` | \(.StartLine) |"' gitleaks.json | head -30 >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ Secret bulunamadı" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scan-secrets
+          path: gitleaks.json
+
+  # =====================================================================
+  # 2) SAST — Semgrep
+  # =====================================================================
+  sast:
+    name: 🔍 SAST
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Semgrep
+        run: pip install --quiet semgrep
+
+      - name: Run Semgrep
+        run: |
+          semgrep scan \
+            --config=p/default \
+            --config=p/security-audit \
+            --config=p/owasp-top-ten \
+            --json --output=semgrep.json \
+            --metrics=off || true
+          [ -s semgrep.json ] || echo '{"results":[]}' > semgrep.json
+
+      - name: Job Summary
+        run: |
+          HIGH=$(jq '[.results[] | select(.extra.severity=="ERROR")]   | length' semgrep.json)
+          MED=$( jq '[.results[] | select(.extra.severity=="WARNING")] | length' semgrep.json)
+          LOW=$( jq '[.results[] | select(.extra.severity=="INFO")]    | length' semgrep.json)
+          echo "## 🔍 SAST (Semgrep)" >> $GITHUB_STEP_SUMMARY
+          echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔴 High  | $HIGH |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟡 Med   | $MED  |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔵 Low   | $LOW  |" >> $GITHUB_STEP_SUMMARY
+          if [ $((HIGH + MED)) -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### İlk 20 bulgu" >> $GITHUB_STEP_SUMMARY
+            echo "| Sev | Kural | Konum |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+            jq -r '.results[]
+              | select(.extra.severity=="ERROR" or .extra.severity=="WARNING")
+              | "| \(.extra.severity) | `\(.check_id)` | `\(.path):\(.start.line)` |"' \
+              semgrep.json | head -20 >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scan-sast
+          path: semgrep.json
+
+  # =====================================================================
+  # 3) SCA — Trivy filesystem
+  # =====================================================================
+  sca:
+    name: 📦 SCA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy fs scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: trivy-fs.json
+          severity: CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: true
+          exit-code: '0'
+          scanners: vuln,misconfig
+
+      - name: Job Summary
+        run: |
+          [ -s trivy-fs.json ] || echo '{"Results":[]}' > trivy-fs.json
+          CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-fs.json)
+          HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")]     | length' trivy-fs.json)
+          MED=$( jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")]   | length' trivy-fs.json)
+          MISC=$(jq '[.Results[]?.Misconfigurations[]?] | length' trivy-fs.json)
+          echo "## 📦 SCA (Trivy fs)" >> $GITHUB_STEP_SUMMARY
+          echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔴 Critical  | $CRIT |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟠 High      | $HIGH |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟡 Medium    | $MED  |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⚙️  Misconfig | $MISC |" >> $GITHUB_STEP_SUMMARY
+          if [ $((CRIT + HIGH)) -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### CRITICAL/HIGH açıklar (ilk 20)" >> $GITHUB_STEP_SUMMARY
+            echo "| Sev | Paket | Sürüm | CVE | Fix |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
+            jq -r '.Results[]?.Vulnerabilities[]?
+              | select(.Severity=="CRITICAL" or .Severity=="HIGH")
+              | "| \(.Severity) | `\(.PkgName)` | \(.InstalledVersion) | \(.VulnerabilityID) | \(.FixedVersion // "n/a") |"' \
+              trivy-fs.json | sort -u | head -20 >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scan-sca
+          path: trivy-fs.json
+
+  # =====================================================================
+  # 4) Container Scan — Trivy image
+  # =====================================================================
+  container-scan:
+    name: 🐳 Container Scan
+    runs-on: ubuntu-latest
+    if: ${{ inputs.enable_container_scan }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dockerfile bul
+        id: df
+        run: |
+          DF=$(find . -name Dockerfile -not -path './node_modules/*' -not -path './.venv/*' | head -1)
+          if [ -z "$DF" ]; then
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo '{"Results":[]}' > trivy-image.json
+            echo "Dockerfile yok, atlanıyor." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "path=$DF" >> $GITHUB_OUTPUT
+            echo "ctx=$(dirname "$DF")" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build image
+        if: steps.df.outputs.found == 'true'
+        run: docker build -f "${{ steps.df.outputs.path }}" -t local/app:scan "${{ steps.df.outputs.ctx }}"
+
+      - name: Trivy image scan
+        if: steps.df.outputs.found == 'true'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: local/app:scan
+          format: json
+          output: trivy-image.json
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: Job Summary
+        if: steps.df.outputs.found == 'true'
+        run: |
+          [ -s trivy-image.json ] || echo '{"Results":[]}' > trivy-image.json
+          CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-image.json)
+          HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")]     | length' trivy-image.json)
+          echo "## 🐳 Container Scan (Trivy image)" >> $GITHUB_STEP_SUMMARY
+          echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔴 Critical | $CRIT |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟠 High     | $HIGH |" >> $GITHUB_STEP_SUMMARY
+          if [ $((CRIT + HIGH)) -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Top açıklar (ilk 20)" >> $GITHUB_STEP_SUMMARY
+            echo "| Sev | Paket | Sürüm | CVE | Fix |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
+            jq -r '.Results[]?.Vulnerabilities[]?
+              | select(.Severity=="CRITICAL" or .Severity=="HIGH")
+              | "| \(.Severity) | `\(.PkgName)` | \(.InstalledVersion) | \(.VulnerabilityID) | \(.FixedVersion // "n/a") |"' \
+              trivy-image.json | sort -u | head -20 >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-container
+          path: trivy-image.json
+          if-no-files-found: ignore
+
+  # =====================================================================
+  # 5) DAST — ZAP Baseline (opsiyonel, uygulama runtime'da ayağa kalkar)
+  # =====================================================================
+  dast:
+    name: 🌐 DAST
+    runs-on: ubuntu-latest
+    needs: [container-scan]
+    if: ${{ inputs.enable_dast }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dockerfile bul ve image build et
+        id: df
+        run: |
+          DF=$(find . -name Dockerfile -not -path './node_modules/*' -not -path './.venv/*' | head -1)
+          if [ -z "$DF" ]; then
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "Dockerfile yok, DAST atlanıyor." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          echo "found=true" >> $GITHUB_OUTPUT
+          docker build -f "$DF" -t local/app:test "$(dirname "$DF")"
+
+      - name: Uygulamayı başlat
+        if: steps.df.outputs.found == 'true' && inputs.dast_start_command != ''
+        run: |
+          ${{ inputs.dast_start_command }}
+          echo "Uygulama başlatıldı, ${{ inputs.dast_wait_seconds }} sn bekleniyor..."
+          sleep ${{ inputs.dast_wait_seconds }}
+          # Hızlı sağlık kontrolü
+          curl -fsS --max-time 5 "${{ inputs.dast_target }}" || echo "uyarı: target henüz cevap vermiyor"
+
+      - name: ZAP Baseline Scan
+        if: steps.df.outputs.found == 'true'
+        uses: zaproxy/action-baseline@v0.13.0
+        with:
+          target: ${{ inputs.dast_target }}
+          cmd_options: '-a -j -T 5'
+          allow_issue_writing: false
+          fail_action: false
+          artifact_name: scan-dast-raw
+
+      - name: ZAP raporu özetle
+        if: steps.df.outputs.found == 'true' && always()
+        run: |
+          echo "## 🌐 DAST (ZAP Baseline)" >> $GITHUB_STEP_SUMMARY
+          echo "**Hedef:** ${{ inputs.dast_target }}" >> $GITHUB_STEP_SUMMARY
+          if [ -f report_json.json ]; then
+            HIGH=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' report_json.json)
+            MED=$( jq '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' report_json.json)
+            LOW=$( jq '[.site[]?.alerts[]? | select(.riskcode=="1")] | length' report_json.json)
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Risk | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔴 High   | $HIGH |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🟡 Medium | $MED  |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔵 Low    | $LOW  |" >> $GITHUB_STEP_SUMMARY
+            cp report_json.json zap.json
+          else
+            echo '{"site":[]}' > zap.json
+            echo "ZAP raporu üretilmedi." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-dast
+          path: zap.json
+          if-no-files-found: ignore
+
+      - name: Uygulamayı durdur
+        if: always()
+        run: docker ps -q | xargs -r docker stop || true
+
+  # =====================================================================
+  # 6) VERDICT — GREEN/YELLOW/RED + Commit Status + DevOps response
+  # =====================================================================
+  verdict:
+    name: 🛡️ Verdict (DevOps Response)
+    runs-on: ubuntu-latest
+    needs: [secret-scan, sast, sca, container-scan, dast]
+    if: always()
+    steps:
+      - name: Tüm tarama çıktılarını indir
+        uses: actions/download-artifact@v4
+        with:
+          path: scans
+          pattern: scan-*
+          merge-multiple: true
+
+      - name: Skor hesapla
+        id: score
+        run: |
+          set -e
+          ls -la scans/ || true
+
+          # Defaults
+          SECRETS=0; SAST_H=0; SAST_M=0
+          SCA_C=0; SCA_H=0
+          IMG_C=0; IMG_H=0
+          ZAP_H=0; ZAP_M=0
+
+          [ -f scans/gitleaks.json ]    && SECRETS=$(jq 'length' scans/gitleaks.json)
+          if [ -f scans/semgrep.json ]; then
+            SAST_H=$(jq '[.results[] | select(.extra.severity=="ERROR")]   | length' scans/semgrep.json)
+            SAST_M=$(jq '[.results[] | select(.extra.severity=="WARNING")] | length' scans/semgrep.json)
+          fi
+          if [ -f scans/trivy-fs.json ]; then
+            SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' scans/trivy-fs.json)
+            SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")]     | length' scans/trivy-fs.json)
+          fi
+          if [ -f scans/trivy-image.json ]; then
+            IMG_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' scans/trivy-image.json)
+            IMG_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")]     | length' scans/trivy-image.json)
+          fi
+          if [ -f scans/zap.json ]; then
+            ZAP_H=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' scans/zap.json)
+            ZAP_M=$(jq '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' scans/zap.json)
+          fi
+
+          TOTAL_CRIT=$((SCA_C + IMG_C))
+          TOTAL_HIGH=$((SAST_H + SCA_H + IMG_H + ZAP_H))
+
+          CTH=${{ inputs.critical_threshold }}
+          HTH=${{ inputs.high_threshold }}
+
+          if [ "$SECRETS" -gt 0 ] || [ "$TOTAL_CRIT" -gt "$CTH" ]; then
+            VERDICT="RED"
+            DECISION="DEPLOY_BLOCKED"
+            REASON="Secret veya CRITICAL bulgu var; localde çalıştırmadan önce düzeltin."
+          elif [ "$TOTAL_HIGH" -gt "$HTH" ]; then
+            VERDICT="YELLOW"
+            DECISION="REVIEW_REQUIRED"
+            REASON="HIGH bulgu eşik üstü; AppSec incelemesi sonrası deploy edin."
+          else
+            VERDICT="GREEN"
+            DECISION="DEPLOY_OK"
+            REASON="Eşikler altında; kurum içi ortamda çalıştırılabilir."
+          fi
+
+          # JSON response — DevOps bunu okuyacak
+          cat > verdict.json <<EOF
+          {
+            "verdict": "$VERDICT",
+            "decision": "$DECISION",
+            "reason": "$REASON",
+            "commit": "${{ github.sha }}",
+            "repo": "${{ github.repository }}",
+            "ref": "${{ github.ref }}",
+            "actor": "${{ github.actor }}",
+            "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "thresholds": { "critical": $CTH, "high": $HTH },
+            "findings": {
+              "secrets":      $SECRETS,
+              "sast_high":    $SAST_H,
+              "sast_medium":  $SAST_M,
+              "sca_critical": $SCA_C,
+              "sca_high":     $SCA_H,
+              "image_critical": $IMG_C,
+              "image_high":   $IMG_H,
+              "dast_high":    $ZAP_H,
+              "dast_medium":  $ZAP_M,
+              "total_critical": $TOTAL_CRIT,
+              "total_high":   $TOTAL_HIGH
+            }
+          }
+          EOF
+
+          # Workflow outputs
+          echo "verdict=$VERDICT"   >> $GITHUB_OUTPUT
+          echo "decision=$DECISION" >> $GITHUB_OUTPUT
+          echo "reason=$REASON"     >> $GITHUB_OUTPUT
+          echo "secrets=$SECRETS"   >> $GITHUB_OUTPUT
+          echo "total_crit=$TOTAL_CRIT" >> $GITHUB_OUTPUT
+          echo "total_high=$TOTAL_HIGH" >> $GITHUB_OUTPUT
+
+          cat verdict.json
+
+      - name: Verdict Job Summary (DevOps karar ekranı)
+        run: |
+          V="${{ steps.score.outputs.verdict }}"
+          D="${{ steps.score.outputs.decision }}"
+          R="${{ steps.score.outputs.reason }}"
+
+          case "$V" in
+            GREEN)  ICON="🟢"; BANNER="DEPLOY OK — Localde çalıştırabilirsiniz" ;;
+            YELLOW) ICON="🟡"; BANNER="REVIEW REQUIRED — AppSec onayı gerekli" ;;
+            RED)    ICON="🔴"; BANNER="DEPLOY BLOCKED — Düzeltmeden çalıştırmayın" ;;
+          esac
+
+          {
+            echo "# $ICON Verdict: **$V**"
+            echo ""
+            echo "## $BANNER"
+            echo ""
+            echo "**Karar:** \`$D\`"
+            echo "**Sebep:** $R"
+            echo ""
+            echo "### DevOps için response"
+            echo '```json'
+            cat verdict.json
+            echo '```'
+            echo ""
+            echo "### Özet sayım"
+            echo "| Tarama | Bulgu |"
+            echo "|---|---|"
+            echo "| 🔐 Secret              | ${{ steps.score.outputs.secrets }} |"
+            echo "| 🔴 Toplam CRITICAL     | ${{ steps.score.outputs.total_crit }} |"
+            echo "| 🟠 Toplam HIGH         | ${{ steps.score.outputs.total_high }} |"
+            echo ""
+            echo "Detay: bu run'ın **Artifacts** kısmı + jobların **Summary** sekmeleri."
+          } >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verdict
+          path: verdict.json
+
+      - name: Commit Status (DevOps gözüne görünür)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const v = "${{ steps.score.outputs.verdict }}";
+            const d = "${{ steps.score.outputs.decision }}";
+            const reason = `${{ steps.score.outputs.reason }}`;
+            const state = v === "GREEN" ? "success"
+                        : v === "YELLOW" ? "success"  // not "failure" ki PR akışını bloklamasın; karar DevOps'ta
+                        : "failure";
+            const description = `${v} — ${d} — ${reason}`.slice(0, 140);
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state,
+              context: "AppSec / Verdict",
+              description,
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+
+      - name: RED ise soft-fail değilse exit 1
+        if: steps.score.outputs.verdict == 'RED' && inputs.soft_fail == false
+        run: |
+          echo "::error::RED verdict + soft_fail=false → workflow FAIL"
+          exit 1
