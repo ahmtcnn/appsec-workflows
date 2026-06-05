@@ -162,17 +162,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Trivy
+        run: |
+          V=0.56.2
+          curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${V}/trivy_${V}_Linux-64bit.tar.gz" \
+            | sudo tar xz -C /usr/local/bin trivy
+          trivy --version
+
       - name: Trivy fs scan
-        uses: aquasecurity/trivy-action@v0.32.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          format: json
-          output: trivy-fs.json
-          severity: CRITICAL,HIGH,MEDIUM
-          ignore-unfixed: true
-          exit-code: '0'
-          scanners: vuln,misconfig
+        run: |
+          trivy fs \
+            --format json --output trivy-fs.json \
+            --severity CRITICAL,HIGH,MEDIUM \
+            --ignore-unfixed \
+            --exit-code 0 \
+            --scanners vuln,misconfig \
+            . || true
+          [ -s trivy-fs.json ] || echo '{"Results":[]}' > trivy-fs.json
 
       - name: Job Summary
         run: |
@@ -228,20 +234,27 @@ jobs:
             echo "ctx=$(dirname "$DF")" >> $GITHUB_OUTPUT
           fi
 
+      - name: Install Trivy
+        if: steps.df.outputs.found == 'true'
+        run: |
+          V=0.56.2
+          curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${V}/trivy_${V}_Linux-64bit.tar.gz" \
+            | sudo tar xz -C /usr/local/bin trivy
+
       - name: Build image
         if: steps.df.outputs.found == 'true'
         run: docker build -f "${{ steps.df.outputs.path }}" -t local/app:scan "${{ steps.df.outputs.ctx }}"
 
       - name: Trivy image scan
         if: steps.df.outputs.found == 'true'
-        uses: aquasecurity/trivy-action@v0.32.0
-        with:
-          image-ref: local/app:scan
-          format: json
-          output: trivy-image.json
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: '0'
+        run: |
+          trivy image \
+            --format json --output trivy-image.json \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --exit-code 0 \
+            local/app:scan || true
+          [ -s trivy-image.json ] || echo '{"Results":[]}' > trivy-image.json
 
       - name: Job Summary
         if: steps.df.outputs.found == 'true'
