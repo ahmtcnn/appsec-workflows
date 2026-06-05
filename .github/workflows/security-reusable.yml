@@ -496,13 +496,13 @@ jobs:
         run: |
           # Rate limit: 50 req/sec, 10 concurrent template, 5sn timeout/req — uygulamayı yormaz
           # Sadece CVE / misconfig / exposure / vuln tag'leri — info/spam'sız
-          # Severity: medium ve üstü
+          # Severity: HIGH ve CRITICAL — medium çıkarıldı, daha hızlı bitsin
           # -no-interactsh: OOB DNS/HTTP callback istemiyoruz (kapalı ortamda anlamsız)
           # -duc: disable update check (offline-friendly)
           nuclei \
             -u "${{ needs.preflight.outputs.dast_target }}" \
             -tags cve,vulnerability,exposure,misconfiguration,default-logins \
-            -severity critical,high,medium \
+            -severity critical,high \
             -rate-limit 50 \
             -concurrency 10 \
             -timeout 5 \
@@ -526,14 +526,12 @@ jobs:
           [ -s nuclei.json ] || echo '[]' > nuclei.json
           CRIT=$(jq '[.[] | select(.info.severity=="critical")] | length' nuclei.json)
           HIGH=$(jq '[.[] | select(.info.severity=="high")]     | length' nuclei.json)
-          MED=$( jq '[.[] | select(.info.severity=="medium")]   | length' nuclei.json)
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| 🔴 Critical | $CRIT |" >> $GITHUB_STEP_SUMMARY
           echo "| 🟠 High     | $HIGH |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🟡 Medium   | $MED  |" >> $GITHUB_STEP_SUMMARY
-          if [ $((CRIT + HIGH + MED)) -gt 0 ]; then
+          if [ $((CRIT + HIGH)) -gt 0 ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### Bulgular" >> $GITHUB_STEP_SUMMARY
             jq -r '.[] | "<details><summary>**\(.info.severity | ascii_upcase)** — \(.info.name) (\(.template-id // .templateID))</summary>\n\nURL: \(.matched-at // .url // "n/a")\n\n\((.info.description // "n/a") | gsub("\n"; " "))\n\n</details>\n"' nuclei.json >> $GITHUB_STEP_SUMMARY
