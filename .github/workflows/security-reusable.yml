@@ -1,47 +1,47 @@
 name: AppSec Security (Reusable)
 
 # Reusable workflow — sadece push'ta tetiklenir (caller tarafında).
-# Caller workflow:
-#   uses: <ORG>/appsec-workflows/.github/workflows/security-reusable.yml@main
-#   with:
-#     enable_dast: true
-#     dast_target: 'http://localhost:5000'
-#     dast_start_command: 'docker run -d -p 5000:5000 --name app local/app:test'
-#     dast_wait_seconds: 15
+#
+# ÖNERILEN CALLER (5 satır, .appsec.yml ile auto-config):
+#   on: { push: {} }
+#   permissions: { contents: read, statuses: write, actions: read }
+#   jobs:
+#     appsec:
+#       uses: <ORG>/appsec-workflows/.github/workflows/security-reusable.yml@main
+#
+# Proje kök dizinine .appsec.yml koy (zorunlu değil, varsa pipeline daha akıllı):
+#   language: python      # python | nodejs | go | java
+#   port: 5000            # Dockerfile EXPOSE ile aynı
+#   health_endpoint: /
+#   dast: true            # aktif DAST ister misin (default: false)
 
 on:
   workflow_call:
     inputs:
+      # Tüm input'lar OPSİYONEL — .appsec.yml ve auto-detect varsa caller hiçbir şey geçmeyebilir.
       enable_container_scan:
-        description: 'Trivy ile docker image taraması'
         type: boolean
         default: true
       enable_dast:
-        description: 'ZAP baseline DAST taraması'
-        type: boolean
-        default: false
-      dast_target:
-        description: 'DAST hedef URL (örn http://localhost:5000)'
+        description: 'DAST override; boş ise .appsec.yml dast değeri kullanılır'
         type: string
-        default: 'http://localhost:5000'
+        default: ''
+      dast_target:
+        type: string
+        default: ''
       dast_start_command:
-        description: 'Uygulamayı başlatan komut (docker run / docker compose up -d)'
         type: string
         default: ''
       dast_wait_seconds:
-        description: 'Uygulamanın hazır olması için bekleme süresi'
         type: number
-        default: 20
+        default: 30
       critical_threshold:
-        description: 'Bu sayının üzerinde CRITICAL bulgu → RED verdict'
         type: number
         default: 0
       high_threshold:
-        description: 'Bu sayının üzerinde HIGH bulgu → YELLOW verdict'
         type: number
         default: 5
       soft_fail:
-        description: 'true ise RED verdict workflow''u FAIL etmez (pilot mod)'
         type: boolean
         default: true
 
@@ -51,6 +51,126 @@ permissions:
   actions: read
 
 jobs:
+
+  # =====================================================================
+  # 0) Pre-flight — proje profilini çıkar (.appsec.yml + file detection)
+  # =====================================================================
+  preflight:
+    name: 🔎 Pre-flight Profile
+    runs-on: ubuntu-latest
+    outputs:
+      project_type:      ${{ steps.detect.outputs.project_type }}
+      has_dockerfile:    ${{ steps.detect.outputs.has_dockerfile }}
+      has_lockfile:      ${{ steps.detect.outputs.has_lockfile }}
+      has_appsec_yml:    ${{ steps.detect.outputs.has_appsec_yml }}
+      port:              ${{ steps.detect.outputs.port }}
+      health_endpoint:   ${{ steps.detect.outputs.health_endpoint }}
+      dast_enabled:      ${{ steps.detect.outputs.dast_enabled }}
+      dast_target:       ${{ steps.detect.outputs.dast_target }}
+      dast_start_command:${{ steps.detect.outputs.dast_start_command }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: detect
+        run: |
+          set -e
+
+          # ---- Dosya tespiti ----
+          if [ -f Dockerfile ]; then DF=true; else DF=false; fi
+          if [ -f package-lock.json ] || [ -f yarn.lock ] || [ -f pnpm-lock.yaml ] || \
+             [ -f poetry.lock ] || [ -f Pipfile.lock ] || [ -f go.sum ]; then
+            LF=true
+          else
+            LF=false
+          fi
+          if [ -f .appsec.yml ]; then AM=true; else AM=false; fi
+
+          # ---- Dil tespiti ----
+          if   [ -f package.json ];        then PT=nodejs
+          elif [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f setup.py ]; then PT=python
+          elif [ -f go.mod ];              then PT=go
+          elif [ -f pom.xml ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then PT=java
+          else PT=unknown
+          fi
+
+          # ---- Default'lar dile göre ----
+          case "$PT" in
+            nodejs) DEF_PORT=3000 ;;
+            python) DEF_PORT=5000 ;;
+            go)     DEF_PORT=8080 ;;
+            java)   DEF_PORT=8080 ;;
+            *)      DEF_PORT=8080 ;;
+          esac
+
+          # ---- .appsec.yml parse (varsa) ----
+          PORT=$DEF_PORT
+          HEALTH=/
+          DAST=false
+          if [ "$AM" = "true" ]; then
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+            PORT=$(yq -r ".port // $DEF_PORT"          .appsec.yml)
+            HEALTH=$(yq -r '.health_endpoint // "/"'   .appsec.yml)
+            DAST=$(yq -r '.dast // false'              .appsec.yml)
+          fi
+
+          # ---- Caller override (input verildiyse onu kullan) ----
+          CALLER_DAST="${{ inputs.enable_dast }}"
+          if [ -n "$CALLER_DAST" ]; then DAST="$CALLER_DAST"; fi
+
+          CALLER_TARGET="${{ inputs.dast_target }}"
+          if [ -n "$CALLER_TARGET" ]; then
+            TARGET="$CALLER_TARGET"
+          else
+            TARGET="http://localhost:${PORT}"
+          fi
+
+          CALLER_CMD='${{ inputs.dast_start_command }}'
+          if [ -n "$CALLER_CMD" ]; then
+            START_CMD="$CALLER_CMD"
+          else
+            # Auto-generate: image build edilecek, sonra port-forward ile çalıştır
+            START_CMD="docker run -d -p ${PORT}:${PORT} --name appsec-scan-target local/app:test"
+          fi
+
+          # ---- Çıktılar ----
+          {
+            echo "project_type=$PT"
+            echo "has_dockerfile=$DF"
+            echo "has_lockfile=$LF"
+            echo "has_appsec_yml=$AM"
+            echo "port=$PORT"
+            echo "health_endpoint=$HEALTH"
+            echo "dast_enabled=$DAST"
+            echo "dast_target=$TARGET"
+            echo "dast_start_command=$START_CMD"
+          } >> $GITHUB_OUTPUT
+
+          # ---- Summary tablo ----
+          {
+            echo "## 🔎 Pre-flight Profile"
+            echo ""
+            echo "| Özellik | Değer |"
+            echo "|---|---|"
+            echo "| Project type     | \`$PT\` |"
+            echo "| Has Dockerfile   | \`$DF\` |"
+            echo "| Has lock file    | \`$LF\` |"
+            echo "| Has .appsec.yml  | \`$AM\` |"
+            echo "| Port             | \`$PORT\` |"
+            echo "| Health endpoint  | \`$HEALTH\` |"
+            echo "| DAST enabled     | \`$DAST\` |"
+            echo "| DAST target      | \`$TARGET\` |"
+            echo ""
+            if [ "$DF" = "false" ]; then
+              echo "⚠️  Dockerfile yok — Container scan ve DAST atlanacak."
+            fi
+            if [ "$LF" = "false" ] && [ "$PT" = "nodejs" ]; then
+              echo "⚠️  package-lock.json yok — SCA için lockfile otomatik üretilecek (kayıp olabilir)."
+            fi
+            if [ "$AM" = "false" ]; then
+              echo "ℹ️  .appsec.yml yok — default değerler kullanıldı. Daha iyi sonuç için ekleyin."
+            fi
+          } >> $GITHUB_STEP_SUMMARY
 
   # =====================================================================
   # 1) Secret Scan — Gitleaks
@@ -177,12 +297,11 @@ jobs:
             fi
           done
 
-      - name: Trivy fs scan
+      - name: Trivy fs scan (unfixed CVE'ler de dahil)
         run: |
           trivy fs \
             --format json --output trivy-fs.json \
             --severity CRITICAL,HIGH,MEDIUM \
-            --ignore-unfixed \
             --exit-code 0 \
             --scanners vuln,misconfig \
             . || true
@@ -219,50 +338,35 @@ jobs:
           path: trivy-fs.json
 
   # =====================================================================
-  # 4) Container Scan — Trivy image
+  # 4) Container Scan — Trivy image (Dockerfile zorunlu, root'ta olmalı)
   # =====================================================================
   container-scan:
     name: 🐳 Container Scan
     runs-on: ubuntu-latest
-    if: ${{ inputs.enable_container_scan }}
+    needs: [preflight]
+    if: needs.preflight.outputs.has_dockerfile == 'true' && inputs.enable_container_scan
     steps:
       - uses: actions/checkout@v4
 
-      - name: Dockerfile bul
-        id: df
-        run: |
-          DF=$(find . -name Dockerfile -not -path './node_modules/*' -not -path './.venv/*' | head -1)
-          if [ -z "$DF" ]; then
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo '{"Results":[]}' > trivy-image.json
-            echo "Dockerfile yok, atlanıyor." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "found=true" >> $GITHUB_OUTPUT
-            echo "path=$DF" >> $GITHUB_OUTPUT
-            echo "ctx=$(dirname "$DF")" >> $GITHUB_OUTPUT
-          fi
-
       - name: Install Trivy
-        if: steps.df.outputs.found == 'true'
         run: |
           V=0.71.0
           curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${V}/trivy_${V}_Linux-64bit.tar.gz" \
             | sudo tar xz -C /usr/local/bin trivy
 
       - name: Build image
-        if: steps.df.outputs.found == 'true'
-        run: docker build -f "${{ steps.df.outputs.path }}" -t local/app:scan "${{ steps.df.outputs.ctx }}"
+        run: docker build -f Dockerfile -t local/app:scan .
 
-      - name: Trivy image scan
-        if: steps.df.outputs.found == 'true'
+      - name: Trivy image scan (unfixed CVE'ler de dahil)
+        id: df
         run: |
           trivy image \
             --format json --output trivy-image.json \
             --severity CRITICAL,HIGH \
-            --ignore-unfixed \
             --exit-code 0 \
             local/app:scan || true
           [ -s trivy-image.json ] || echo '{"Results":[]}' > trivy-image.json
+          echo "found=true" >> $GITHUB_OUTPUT
 
       - name: Job Summary
         if: steps.df.outputs.found == 'true'
@@ -294,49 +398,51 @@ jobs:
           if-no-files-found: ignore
 
   # =====================================================================
-  # 5) DAST — ZAP Baseline (opsiyonel, uygulama runtime'da ayağa kalkar)
+  # 5) DAST — ZAP Active Scan (kısa: spider 2dk + active scan, ~5-8 dk toplam)
+  #    Preflight'tan port/start_command alır; .appsec.yml dast:true gerekli.
   # =====================================================================
   dast:
-    name: 🌐 DAST
+    name: 🌐 DAST (Active)
     runs-on: ubuntu-latest
-    needs: [container-scan]
-    if: ${{ inputs.enable_dast }}
+    needs: [preflight, container-scan]
+    if: needs.preflight.outputs.dast_enabled == 'true' && needs.preflight.outputs.has_dockerfile == 'true'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Dockerfile bul ve image build et
+      - name: Image build
         id: df
         run: |
-          DF=$(find . -name Dockerfile -not -path './node_modules/*' -not -path './.venv/*' | head -1)
-          if [ -z "$DF" ]; then
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "Dockerfile yok, DAST atlanıyor." >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
+          docker build -f Dockerfile -t local/app:test .
           echo "found=true" >> $GITHUB_OUTPUT
-          docker build -f "$DF" -t local/app:test "$(dirname "$DF")"
 
       - name: Uygulamayı başlat ve hazır olmasını bekle
-        if: steps.df.outputs.found == 'true' && inputs.dast_start_command != ''
         run: |
-          ${{ inputs.dast_start_command }}
+          ${{ needs.preflight.outputs.dast_start_command }}
+          TARGET="${{ needs.preflight.outputs.dast_target }}${{ needs.preflight.outputs.health_endpoint }}"
           echo "Uygulama başlatıldı, ${{ inputs.dast_wait_seconds }} sn'ye kadar hazırlık bekleniyor..."
+          READY=false
           for i in $(seq 1 ${{ inputs.dast_wait_seconds }}); do
-            if curl -fsS --max-time 2 "${{ inputs.dast_target }}" > /dev/null 2>&1; then
-              echo "✅ Uygulama ${i}sn sonra hazır."
+            if curl -fsS --max-time 2 "$TARGET" > /dev/null 2>&1; then
+              echo "✅ Uygulama ${i}sn sonra hazır ($TARGET)."
+              READY=true
               break
             fi
             sleep 1
           done
-          echo "--- docker ps ---"; docker ps -a
-          echo "--- container logs ---"; docker ps -aq | head -1 | xargs -r docker logs 2>&1 | tail -30 || true
+          if [ "$READY" != "true" ]; then
+            echo "⚠️ Uygulama hazır değil, container logları:"
+            docker ps -a
+            docker ps -aq | head -1 | xargs -r docker logs 2>&1 | tail -50 || true
+            echo "::warning::App did not respond on $TARGET; ZAP will still try."
+          fi
 
-      - name: ZAP Baseline Scan
+      - name: ZAP Active Scan (kısa)
         if: steps.df.outputs.found == 'true'
-        uses: zaproxy/action-baseline@v0.15.0
+        uses: zaproxy/action-full-scan@v0.12.0
         with:
-          target: ${{ inputs.dast_target }}
-          cmd_options: '-a -j -T 5'
+          target: ${{ needs.preflight.outputs.dast_target }}
+          # -m 2: spider 2 dk, -T 3: passive scan timeout 3 dk, -a alpha rules, -j ajax spider
+          cmd_options: '-m 2 -T 3 -a -j'
           allow_issue_writing: false
           fail_action: false
           artifact_name: scan-dast-raw
@@ -384,7 +490,7 @@ jobs:
   verdict:
     name: 🛡️ Verdict (DevOps Response)
     runs-on: ubuntu-latest
-    needs: [secret-scan, sast, sca, container-scan, dast]
+    needs: [preflight, secret-scan, sast, sca, container-scan, dast]
     if: always()
     steps:
       - name: Tüm tarama çıktılarını indir
@@ -477,9 +583,21 @@ jobs:
             --argjson top_sca "$TOP_SCA" \
             --argjson top_img "$TOP_IMG" \
             --argjson top_dast "$TOP_DAST" \
+            --arg project_type    "${{ needs.preflight.outputs.project_type }}" \
+            --arg has_dockerfile  "${{ needs.preflight.outputs.has_dockerfile }}" \
+            --arg has_lockfile    "${{ needs.preflight.outputs.has_lockfile }}" \
+            --arg has_appsec_yml  "${{ needs.preflight.outputs.has_appsec_yml }}" \
+            --arg dast_enabled    "${{ needs.preflight.outputs.dast_enabled }}" \
             '{
               verdict: $verdict, decision: $decision, reason: $reason,
               commit: $commit, repo: $repo, ref: $ref, actor: $actor, run_url: $run_url,
+              project: {
+                type: $project_type,
+                has_dockerfile: $has_dockerfile,
+                has_lockfile: $has_lockfile,
+                has_appsec_yml: $has_appsec_yml,
+                dast_enabled: $dast_enabled
+              },
               thresholds: {critical: $cth, high: $hth},
               findings: {
                 secrets: $secrets, sast_high: $sast_h, sast_medium: $sast_m,
