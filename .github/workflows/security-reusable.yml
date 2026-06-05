@@ -164,7 +164,7 @@ jobs:
 
       - name: Install Trivy
         run: |
-          V=0.56.2
+          V=0.71.0
           curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${V}/trivy_${V}_Linux-64bit.tar.gz" \
             | sudo tar xz -C /usr/local/bin trivy
           trivy --version
@@ -237,7 +237,7 @@ jobs:
       - name: Install Trivy
         if: steps.df.outputs.found == 'true'
         run: |
-          V=0.56.2
+          V=0.71.0
           curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${V}/trivy_${V}_Linux-64bit.tar.gz" \
             | sudo tar xz -C /usr/local/bin trivy
 
