@@ -67,7 +67,7 @@ jobs:
       health_endpoint:   ${{ steps.detect.outputs.health_endpoint }}
       dast_enabled:      ${{ steps.detect.outputs.dast_enabled }}
       dast_target:       ${{ steps.detect.outputs.dast_target }}
-      dast_start_command:${{ steps.detect.outputs.dast_start_command }}
+      dast_start_command: ${{ steps.detect.outputs.dast_start_command }}
     steps:
       - uses: actions/checkout@v4
 
