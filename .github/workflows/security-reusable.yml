@@ -481,7 +481,7 @@ jobs:
           if-no-files-found: ignore
 
       # ---- Nuclei: template-based vulnerability scan (CVE, misconfig, exposure)
-      - name: Install Nuclei
+      - name: Install Nuclei + templates
         if: steps.df.outputs.found == 'true'
         run: |
           V=3.8.0
@@ -489,6 +489,8 @@ jobs:
           unzip -q /tmp/nuclei.zip -d /tmp/nuclei
           sudo mv /tmp/nuclei/nuclei /usr/local/bin/
           nuclei -version 2>&1 | head -3
+          # Template DB indir (sessizce, log şişmesin)
+          nuclei -update-templates -silent 2>&1 | tail -5 || true
 
       - name: Nuclei scan (rate-limited)
         if: steps.df.outputs.found == 'true'
@@ -498,7 +500,6 @@ jobs:
           # Sadece CVE / misconfig / exposure / vuln tag'leri — info/spam'sız
           # Severity: HIGH ve CRITICAL — medium çıkarıldı, daha hızlı bitsin
           # -no-interactsh: OOB DNS/HTTP callback istemiyoruz (kapalı ortamda anlamsız)
-          # -duc: disable update check (offline-friendly)
           nuclei \
             -u "${{ needs.preflight.outputs.dast_target }}" \
             -tags cve,vulnerability,exposure,misconfiguration,default-logins \
@@ -508,7 +509,6 @@ jobs:
             -timeout 5 \
             -retries 1 \
             -no-interactsh \
-            -duc \
             -silent \
             -jsonl -o nuclei.jsonl \
             -stats 2>&1 | tail -30 || true
