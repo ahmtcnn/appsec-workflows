@@ -50,6 +50,11 @@ permissions:
   statuses: write   # commit status için
   actions: read
 
+# Aynı ref'e eşzamanlı push olursa eskisini iptal et, sadece son commit taransın
+concurrency:
+  group: appsec-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
 
   # =====================================================================
@@ -58,6 +63,7 @@ jobs:
   preflight:
     name: 🔎 Pre-flight Profile
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       project_type:      ${{ steps.detect.outputs.project_type }}
       has_dockerfile:    ${{ steps.detect.outputs.has_dockerfile }}
@@ -178,16 +184,30 @@ jobs:
   secret-scan:
     name: 🔐 Secret Scan
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install Gitleaks
+      - name: Cache Gitleaks binary
+        id: cache-gitleaks
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/gitleaks
+          key: gitleaks-v8.21.2-linux-x64
+
+      - name: Install Gitleaks (cache miss)
+        if: steps.cache-gitleaks.outputs.cache-hit != 'true'
         run: |
           V=8.21.2
-          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz" \
-            | sudo tar xz -C /usr/local/bin gitleaks
+          for i in 1 2 3; do
+            if curl -sSL --retry 3 --retry-delay 5 --max-time 60 \
+                "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz" \
+                -o /tmp/gitleaks.tar.gz; then break; fi
+            echo "Retry $i/3..."; sleep $((i * 5))
+          done
+          sudo tar xz -C /usr/local/bin -f /tmp/gitleaks.tar.gz gitleaks
           gitleaks version
 
       - name: Run Gitleaks
@@ -227,23 +247,69 @@ jobs:
   sast:
     name: 🔍 SAST
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50   # baseline scan için yeterli geçmiş
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
+
+      - name: Cache Semgrep rules + metadata
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.semgrep
+            ~/.cache/semgrep
+          key: semgrep-${{ runner.os }}-v1
+          restore-keys: |
+            semgrep-${{ runner.os }}-
 
       - name: Install Semgrep
         run: pip install --quiet semgrep
 
+      - name: Determine baseline (incremental scan when mümkün)
+        id: baseline
+        run: |
+          # main'e push → tam tarama; başka branch'e push → main ile diff
+          if [ "$GITHUB_REF" = "refs/heads/main" ] || [ "$GITHUB_REF" = "refs/heads/master" ]; then
+            echo "mode=full" >> $GITHUB_OUTPUT
+            echo "baseline=" >> $GITHUB_OUTPUT
+            echo "Full scan (main branch)"
+          else
+            git fetch origin main:refs/remotes/origin/main --depth=50 2>/dev/null || \
+              git fetch origin master:refs/remotes/origin/master --depth=50 2>/dev/null || true
+            BASE=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD origin/master 2>/dev/null || echo "")
+            if [ -n "$BASE" ]; then
+              echo "mode=incremental" >> $GITHUB_OUTPUT
+              echo "baseline=$BASE" >> $GITHUB_OUTPUT
+              echo "Incremental scan from $BASE"
+            else
+              echo "mode=full" >> $GITHUB_OUTPUT
+              echo "baseline=" >> $GITHUB_OUTPUT
+              echo "Full scan (no baseline found)"
+            fi
+          fi
+
       - name: Run Semgrep
         run: |
+          BASELINE_ARG=""
+          if [ -n "${{ steps.baseline.outputs.baseline }}" ]; then
+            BASELINE_ARG="--baseline-commit ${{ steps.baseline.outputs.baseline }}"
+          fi
           semgrep scan \
             --config=p/default \
             --config=p/security-audit \
             --config=p/owasp-top-ten \
+            --jobs $(nproc) \
+            --timeout 60 \
+            --max-target-bytes 5000000 \
             --json --output=semgrep.json \
-            --metrics=off || true
+            --metrics=off \
+            $BASELINE_ARG || true
           [ -s semgrep.json ] || echo '{"results":[]}' > semgrep.json
 
       - name: Job Summary
@@ -277,15 +343,39 @@ jobs:
   sca:
     name: 📦 SCA
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Trivy
+      - name: Cache Trivy binary
+        id: cache-trivy-bin
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/trivy
+          key: trivy-v0.71.0-linux-64bit
+
+      - name: Install Trivy (cache miss)
+        if: steps.cache-trivy-bin.outputs.cache-hit != 'true'
         run: |
           V=0.71.0
-          curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${V}/trivy_${V}_Linux-64bit.tar.gz" \
-            | sudo tar xz -C /usr/local/bin trivy
+          for i in 1 2 3; do
+            if curl -sSL --retry 3 --retry-delay 5 --max-time 90 \
+                "https://github.com/aquasecurity/trivy/releases/download/v${V}/trivy_${V}_Linux-64bit.tar.gz" \
+                -o /tmp/trivy.tar.gz; then break; fi
+            echo "Retry $i/3..."; sleep $((i * 5))
+          done
+          sudo tar xz -C /usr/local/bin -f /tmp/trivy.tar.gz trivy
           trivy --version
+
+      - name: Cache Trivy vulnerability DB
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/trivy/db
+            ~/.cache/trivy/java-db
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: |
+            trivy-db-
 
       - name: Generate Node lockfile if missing (so Trivy can scan)
         run: |
@@ -297,13 +387,15 @@ jobs:
             fi
           done
 
-      - name: Trivy fs scan (unfixed CVE'ler de dahil)
+      - name: Trivy fs scan (unfixed CVE'ler de dahil, cached DB)
         run: |
           trivy fs \
+            --cache-dir ~/.cache/trivy \
             --format json --output trivy-fs.json \
             --severity CRITICAL,HIGH,MEDIUM \
             --exit-code 0 \
             --scanners vuln,misconfig \
+            --parallel 5 \
             . || true
           [ -s trivy-fs.json ] || echo '{"Results":[]}' > trivy-fs.json
 
@@ -343,27 +435,54 @@ jobs:
   container-scan:
     name: 🐳 Container Scan
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [preflight]
     if: needs.preflight.outputs.has_dockerfile == 'true' && inputs.enable_container_scan
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Trivy
+      - name: Cache Trivy binary
+        id: cache-trivy-bin
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/trivy
+          key: trivy-v0.71.0-linux-64bit
+
+      - name: Install Trivy (cache miss)
+        if: steps.cache-trivy-bin.outputs.cache-hit != 'true'
         run: |
           V=0.71.0
-          curl -sSL "https://github.com/aquasecurity/trivy/releases/download/v${V}/trivy_${V}_Linux-64bit.tar.gz" \
-            | sudo tar xz -C /usr/local/bin trivy
+          for i in 1 2 3; do
+            if curl -sSL --retry 3 --retry-delay 5 --max-time 90 \
+                "https://github.com/aquasecurity/trivy/releases/download/v${V}/trivy_${V}_Linux-64bit.tar.gz" \
+                -o /tmp/trivy.tar.gz; then break; fi
+            echo "Retry $i/3..."; sleep $((i * 5))
+          done
+          sudo tar xz -C /usr/local/bin -f /tmp/trivy.tar.gz trivy
+
+      - name: Cache Trivy vulnerability DB
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/trivy/db
+            ~/.cache/trivy/java-db
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: |
+            trivy-db-
 
       - name: Build image
         run: docker build -f Dockerfile -t local/app:scan .
 
-      - name: Trivy image scan (unfixed CVE'ler de dahil)
+      - name: Trivy image scan (cached DB, unfixed dahil)
         id: df
         run: |
           trivy image \
+            --cache-dir ~/.cache/trivy \
             --format json --output trivy-image.json \
             --severity CRITICAL,HIGH \
             --exit-code 0 \
+            --scanners vuln,misconfig \
+            --parallel 5 \
             local/app:scan || true
           [ -s trivy-image.json ] || echo '{"Results":[]}' > trivy-image.json
           echo "found=true" >> $GITHUB_OUTPUT
@@ -398,60 +517,51 @@ jobs:
           if-no-files-found: ignore
 
   # =====================================================================
-  # 5) DAST — ZAP Active Scan (kısa: spider 2dk + active scan, ~5-8 dk toplam)
-  #    Preflight'tan port/start_command alır; .appsec.yml dast:true gerekli.
+  # 5a) DAST — ZAP Active Scan (kendi job'u, paralel)
   # =====================================================================
-  dast:
-    name: 🌐 DAST (Active)
+  dast-zap:
+    name: 🌐 DAST (ZAP)
     runs-on: ubuntu-latest
-    needs: [preflight, container-scan]
+    timeout-minutes: 20
+    needs: [preflight]
     if: needs.preflight.outputs.dast_enabled == 'true' && needs.preflight.outputs.has_dockerfile == 'true'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Image build
+      - name: Image build + start app
         id: df
         run: |
           docker build -f Dockerfile -t local/app:test .
-          echo "found=true" >> $GITHUB_OUTPUT
-
-      - name: Uygulamayı başlat ve hazır olmasını bekle
-        run: |
           ${{ needs.preflight.outputs.dast_start_command }}
           TARGET="${{ needs.preflight.outputs.dast_target }}${{ needs.preflight.outputs.health_endpoint }}"
-          echo "Uygulama başlatıldı, ${{ inputs.dast_wait_seconds }} sn'ye kadar hazırlık bekleniyor..."
           READY=false
           for i in $(seq 1 ${{ inputs.dast_wait_seconds }}); do
             if curl -fsS --max-time 2 "$TARGET" > /dev/null 2>&1; then
               echo "✅ Uygulama ${i}sn sonra hazır ($TARGET)."
-              READY=true
-              break
+              READY=true; break
             fi
             sleep 1
           done
           if [ "$READY" != "true" ]; then
-            echo "⚠️ Uygulama hazır değil, container logları:"
-            docker ps -a
             docker ps -aq | head -1 | xargs -r docker logs 2>&1 | tail -50 || true
-            echo "::warning::App did not respond on $TARGET; ZAP will still try."
+            echo "::warning::App did not respond on $TARGET"
           fi
+          echo "found=true" >> $GITHUB_OUTPUT
 
       - name: ZAP Active Scan (kısa)
-        if: steps.df.outputs.found == 'true'
         uses: zaproxy/action-full-scan@v0.12.0
         with:
           target: ${{ needs.preflight.outputs.dast_target }}
-          # -m 2: spider 2 dk, -T 3: passive scan timeout 3 dk, -a alpha rules, -j ajax spider
           cmd_options: '-m 2 -T 3 -a -j'
           allow_issue_writing: false
           fail_action: false
-          artifact_name: scan-dast-raw
+          artifact_name: scan-zap-raw
 
       - name: ZAP raporu özetle
-        if: steps.df.outputs.found == 'true' && always()
+        if: always()
         run: |
-          echo "## 🌐 DAST (ZAP Baseline)" >> $GITHUB_STEP_SUMMARY
-          echo "**Hedef:** ${{ inputs.dast_target }}" >> $GITHUB_STEP_SUMMARY
+          echo "## 🌐 DAST (ZAP Active)" >> $GITHUB_STEP_SUMMARY
+          echo "**Hedef:** ${{ needs.preflight.outputs.dast_target }}" >> $GITHUB_STEP_SUMMARY
           if [ -f report_json.json ]; then
             HIGH=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' report_json.json)
             MED=$( jq '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' report_json.json)
@@ -480,26 +590,81 @@ jobs:
           path: zap.json
           if-no-files-found: ignore
 
-      # ---- Nuclei: template-based vulnerability scan (CVE, misconfig, exposure)
-      - name: Install Nuclei + templates
-        if: steps.df.outputs.found == 'true'
+      - name: Uygulamayı durdur
+        if: always()
+        run: docker ps -q | xargs -r docker stop || true
+
+  # =====================================================================
+  # 5b) DAST — Nuclei (kendi job'u, paralel)
+  # =====================================================================
+  dast-nuclei:
+    name: 🎯 DAST (Nuclei)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [preflight]
+    if: needs.preflight.outputs.dast_enabled == 'true' && needs.preflight.outputs.has_dockerfile == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Nuclei binary
+        id: cache-nuclei-bin
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/nuclei
+          key: nuclei-v3.8.0-linux-amd64
+
+      - name: Install Nuclei (cache miss)
+        if: steps.cache-nuclei-bin.outputs.cache-hit != 'true'
         run: |
           V=3.8.0
-          curl -sSL "https://github.com/projectdiscovery/nuclei/releases/download/v${V}/nuclei_${V}_linux_amd64.zip" -o /tmp/nuclei.zip
+          for i in 1 2 3; do
+            if curl -sSL --retry 3 --retry-delay 5 --max-time 60 \
+                "https://github.com/projectdiscovery/nuclei/releases/download/v${V}/nuclei_${V}_linux_amd64.zip" \
+                -o /tmp/nuclei.zip; then break; fi
+            echo "Retry $i/3..."; sleep $((i * 5))
+          done
           unzip -q /tmp/nuclei.zip -d /tmp/nuclei
           sudo mv /tmp/nuclei/nuclei /usr/local/bin/
           nuclei -version 2>&1 | head -3
-          # Template DB indir (sessizce, log şişmesin)
-          nuclei -update-templates -silent 2>&1 | tail -5 || true
 
-      - name: Nuclei scan (rate-limited)
-        if: steps.df.outputs.found == 'true'
+      - name: Cache Nuclei templates
+        id: cache-nuclei-templates
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/nuclei-templates
+            ~/.config/nuclei
+          key: nuclei-templates-${{ github.run_id }}
+          restore-keys: |
+            nuclei-templates-
+
+      - name: Update Nuclei templates (cache miss veya stale)
+        if: steps.cache-nuclei-templates.outputs.cache-hit != 'true'
+        run: nuclei -update-templates -silent 2>&1 | tail -5 || true
+
+      - name: Image build + start app
+        id: df
+        run: |
+          docker build -f Dockerfile -t local/app:test .
+          ${{ needs.preflight.outputs.dast_start_command }}
+          TARGET="${{ needs.preflight.outputs.dast_target }}${{ needs.preflight.outputs.health_endpoint }}"
+          READY=false
+          for i in $(seq 1 ${{ inputs.dast_wait_seconds }}); do
+            if curl -fsS --max-time 2 "$TARGET" > /dev/null 2>&1; then
+              echo "✅ Uygulama ${i}sn sonra hazır ($TARGET)."
+              READY=true; break
+            fi
+            sleep 1
+          done
+          if [ "$READY" != "true" ]; then
+            docker ps -aq | head -1 | xargs -r docker logs 2>&1 | tail -50 || true
+            echo "::warning::App did not respond on $TARGET"
+          fi
+          echo "found=true" >> $GITHUB_OUTPUT
+
+      - name: Nuclei scan (rate-limited, CRITICAL+HIGH)
         timeout-minutes: 7
         run: |
-          # Rate limit: 50 req/sec, 10 concurrent template, 5sn timeout/req — uygulamayı yormaz
-          # Sadece CVE / misconfig / exposure / vuln tag'leri — info/spam'sız
-          # Severity: HIGH ve CRITICAL — medium çıkarıldı, daha hızlı bitsin
-          # -no-interactsh: OOB DNS/HTTP callback istemiyoruz (kapalı ortamda anlamsız)
           nuclei \
             -u "${{ needs.preflight.outputs.dast_target }}" \
             -tags cve,vulnerability,exposure,misconfiguration,default-logins \
@@ -514,12 +679,11 @@ jobs:
             -stats 2>&1 | tail -30 || true
 
           [ -s nuclei.jsonl ] || echo "" > nuclei.jsonl
-          # JSONL → JSON array (verdict job daha kolay parse etsin)
           jq -s '.' nuclei.jsonl > nuclei.json
           echo "Bulgu sayısı: $(jq 'length' nuclei.json)"
 
       - name: Nuclei raporu özetle
-        if: steps.df.outputs.found == 'true' && always()
+        if: always()
         run: |
           echo "## 🎯 DAST (Nuclei templates)" >> $GITHUB_STEP_SUMMARY
           echo "**Hedef:** ${{ needs.preflight.outputs.dast_target }}" >> $GITHUB_STEP_SUMMARY
@@ -554,8 +718,9 @@ jobs:
   verdict:
     name: 🛡️ Verdict (DevOps Response)
     runs-on: ubuntu-latest
-    needs: [preflight, secret-scan, sast, sca, container-scan, dast]
-    if: always()
+    timeout-minutes: 5
+    needs: [preflight, secret-scan, sast, sca, container-scan, dast-zap, dast-nuclei]
+    if: always() && needs.preflight.result == 'success'
     steps:
       - name: Tüm tarama çıktılarını indir
         uses: actions/download-artifact@v4
