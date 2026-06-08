@@ -690,6 +690,10 @@ jobs:
             fi
           done
 
+          # ---- ZAP work dizini (container user yazabilsin) ----
+          mkdir -p zap-work
+          chmod 777 zap-work
+
           # ---- Her component için ZAP scan ----
           for i in $(seq 0 $((COUNT-1))); do
             COMP=$(echo "$COMPONENTS" | jq -c ".[$i]")
@@ -699,12 +703,17 @@ jobs:
 
             echo "🔍 [$NAME] ZAP scan: $URL"
             docker run --rm --network=host \
-              -v "$PWD:/zap/wrk:rw" \
+              -v "$PWD/zap-work:/zap/wrk:rw" \
               -t ghcr.io/zaproxy/zaproxy:stable \
               zap-full-scan.py \
               -t "$URL" \
               -m 2 -T 3 -a -j \
               -J "report_${NAME}.json" || true
+
+            # Çıktıyı dışarı taşı (PWD'de toplansın)
+            if [ -f "zap-work/report_${NAME}.json" ]; then
+              cp "zap-work/report_${NAME}.json" "./report_${NAME}.json"
+            fi
           done
 
           # ---- Sonuçları birleştir ----
