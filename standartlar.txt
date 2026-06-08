@@ -320,6 +320,59 @@ EKSIK DURUM:
 
 
 --------------------------------------------------------------
+15) MULTI-COMPONENT DAST (frontend + backend, mikroservis)
+--------------------------------------------------------------
+
+Tek bir uygulamadan fazlası varsa (örn. frontend + backend),
+.appsec.yml'a `components:` ekle. Her bileşen için:
+  - name:           kısa isim (backend, frontend, api, worker)
+  - port:           dinlediği port (zorunlu)
+  - start:          nasıl başlatılacağı (zorunlu, shell komutu)
+  - health:         hazır olduğunu gösteren endpoint (default: /)
+  - wait_seconds:   hazır olmasını kaç sn beklemeli (default: 30)
+
+ÖRNEK (1 backend + 1 frontend):
+
+  language: nodejs
+  dast: true
+  components:
+    - name: backend
+      port: 5000
+      start: docker run -d -p 5000:5000 --name backend local/app:test
+      health: /api/health
+      wait_seconds: 30
+    - name: frontend
+      port: 3000
+      start: cd frontend && npm install --silent && npm run dev
+      health: /
+      wait_seconds: 60
+
+ÖRNEK (2 backend + 1 frontend):
+
+  components:
+    - name: backend-api
+      port: 5000
+      start: docker run -d -p 5000:5000 --name api local/api:test
+      health: /health
+    - name: backend-worker
+      port: 5001
+      start: docker run -d -p 5001:5001 --name worker local/worker:test
+      health: /health
+    - name: frontend
+      port: 3000
+      start: cd web && npm install --silent && npm start
+      health: /
+
+NOTLAR:
+  - components yoksa, eski tek-port mantığı (port: + dast:) aynen
+    çalışır. Yani vibecoder bunu yazmasa da problem değil.
+  - components zaten varsa eski port: alanı kullanılmaz.
+  - Pipeline tüm bileşenleri SIRAYLA başlatır (önce backend
+    sonra frontend - frontend backend'e bağımlıysa çalışır).
+  - Her bileşene ayrı ZAP ve Nuclei scan koşar, raporda
+    component bazlı gösterilir.
+
+--------------------------------------------------------------
 SON
 --------------------------------------------------------------
 

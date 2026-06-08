@@ -77,6 +77,8 @@ jobs:
       dast_enabled:      ${{ steps.detect.outputs.dast_enabled }}
       dast_target:       ${{ steps.detect.outputs.dast_target }}
       dast_start_command: ${{ steps.detect.outputs.dast_start_command }}
+      components_json:   ${{ steps.detect.outputs.components_json }}
+      components_count:  ${{ steps.detect.outputs.components_count }}
     steps:
       - uses: actions/checkout@v4
 
@@ -172,6 +174,28 @@ jobs:
             fi
           fi
 
+          # ---- Components (multi-component DAST) ----
+          COMPONENTS_JSON='[]'
+          COMPONENTS_COUNT=0
+          if [ "$AM" = "true" ] && yq -e '.components | type == "!!seq"' .appsec.yml > /dev/null 2>&1; then
+            # .appsec.yml'da components: array var
+            COMPONENTS_JSON=$(yq -o=json '.components' .appsec.yml | jq -c '[.[] | {
+              name: (.name // "app"),
+              port: (.port // 8080),
+              start: (.start // ""),
+              health: (.health // "/"),
+              wait_seconds: (.wait_seconds // 30)
+            }]')
+            COMPONENTS_COUNT=$(echo "$COMPONENTS_JSON" | jq 'length')
+
+            # Validation: name+port+start zorunlu, eksikse error
+            MISSING=$(echo "$COMPONENTS_JSON" | jq -r '.[] | select(.name=="" or .port==0 or .start=="") | .name')
+            if [ -n "$MISSING" ]; then
+              echo "::error::components içinde name/port/start eksik bileşen var: $MISSING (standartlar.txt §15)"
+            fi
+            echo "🧩 Multi-component mode: $COMPONENTS_COUNT component bulundu"
+          fi
+
           # ---- Caller override (input verildiyse onu kullan) ----
           CALLER_DAST="${{ inputs.enable_dast }}"
           if [ -n "$CALLER_DAST" ]; then DAST="$CALLER_DAST"; fi
@@ -191,6 +215,13 @@ jobs:
             START_CMD="docker run -d -p ${PORT}:${PORT} --name appsec-scan-target local/app:test"
           fi
 
+          # ---- Components synthesize (multi yoksa, eski tek-component'i synthesize et) ----
+          if [ "$COMPONENTS_COUNT" -eq 0 ]; then
+            COMPONENTS_JSON=$(jq -nc --arg port "$PORT" --arg start "$START_CMD" --arg health "$HEALTH" \
+              '[{name: "app", port: ($port|tonumber), start: $start, health: $health, wait_seconds: 30}]')
+            COMPONENTS_COUNT=1
+          fi
+
           # ---- Çıktılar ----
           {
             echo "project_type=$PT"
@@ -205,6 +236,8 @@ jobs:
             echo "dast_enabled=$DAST"
             echo "dast_target=$TARGET"
             echo "dast_start_command=$START_CMD"
+            echo "components_json=$COMPONENTS_JSON"
+            echo "components_count=$COMPONENTS_COUNT"
           } >> $GITHUB_OUTPUT
 
           # ---- Summary tablo ----
@@ -225,7 +258,15 @@ jobs:
             echo "| Health endpoint  | \`$HEALTH\` |"
             echo "| DAST enabled     | \`$DAST\` |"
             echo "| DAST target      | \`$TARGET\` |"
+            echo "| Components       | \`$COMPONENTS_COUNT\` |"
             echo ""
+            if [ "$COMPONENTS_COUNT" -gt 1 ]; then
+              echo "**Multi-component DAST:**"
+              echo "| Name | Port | Health | Start |"
+              echo "|---|---|---|---|"
+              echo "$COMPONENTS_JSON" | jq -r '.[] | "| `\(.name)` | `\(.port)` | `\(.health)` | `\(.start | .[0:60])` |"'
+              echo ""
+            fi
             if [ "$DF" = "false" ]; then
               echo "❌ **Dockerfile bulunamadı (recursive ile bile)** — Container scan ve DAST atlanacak. Vibecoder Dockerfile commit etmeli."
             elif [ "$DF_AT_ROOT" = "false" ]; then
@@ -592,68 +633,114 @@ jobs:
   dast-zap:
     name: 🌐 DAST (ZAP)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     needs: [preflight]
     if: needs.preflight.outputs.dast_enabled == 'true' && needs.preflight.outputs.has_dockerfile == 'true'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Image build + start app
-        id: df
+      - name: Build image (varsa)
+        if: needs.preflight.outputs.has_dockerfile == 'true'
         run: |
           docker build \
             -f "${{ needs.preflight.outputs.dockerfile_path }}" \
             -t local/app:test \
             "${{ needs.preflight.outputs.dockerfile_dir }}"
-          ${{ needs.preflight.outputs.dast_start_command }}
-          TARGET="${{ needs.preflight.outputs.dast_target }}${{ needs.preflight.outputs.health_endpoint }}"
-          READY=false
-          for i in $(seq 1 ${{ inputs.dast_wait_seconds }}); do
-            if curl -fsS --max-time 2 "$TARGET" > /dev/null 2>&1; then
-              echo "✅ Uygulama ${i}sn sonra hazır ($TARGET)."
-              READY=true; break
-            fi
-            sleep 1
-          done
-          if [ "$READY" != "true" ]; then
-            docker ps -aq | head -1 | xargs -r docker logs 2>&1 | tail -50 || true
-            echo "::warning::App did not respond on $TARGET"
-          fi
-          echo "found=true" >> $GITHUB_OUTPUT
 
-      - name: ZAP Active Scan (kısa)
-        uses: zaproxy/action-full-scan@v0.12.0
-        with:
-          target: ${{ needs.preflight.outputs.dast_target }}
-          cmd_options: '-m 2 -T 3 -a -j'
-          allow_issue_writing: false
-          fail_action: false
-          artifact_name: scan-zap-raw
+      - name: Start all components + ZAP scan each
+        id: scan
+        run: |
+          set +e
+          COMPONENTS='${{ needs.preflight.outputs.components_json }}'
+          COUNT=$(echo "$COMPONENTS" | jq 'length')
+          echo "🧩 $COUNT component DAST scan'i koşacak"
+
+          declare -a BG_PIDS=()
+          cleanup() {
+            for pid in "${BG_PIDS[@]}"; do kill $pid 2>/dev/null || true; done
+            docker ps -q | xargs -r docker stop 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          # ---- Tüm component'leri başlat ----
+          for i in $(seq 0 $((COUNT-1))); do
+            COMP=$(echo "$COMPONENTS" | jq -c ".[$i]")
+            NAME=$(echo "$COMP" | jq -r .name)
+            PORT=$(echo "$COMP" | jq -r .port)
+            START=$(echo "$COMP" | jq -r .start)
+            HEALTH=$(echo "$COMP" | jq -r '.health // "/"')
+            WAIT=$(echo "$COMP" | jq -r '.wait_seconds // 30')
+
+            echo "▶ [$NAME] başlatılıyor (port $PORT): $START"
+            bash -c "$START" > "logs-${NAME}.log" 2>&1 &
+            BG_PIDS+=($!)
+
+            READY=false
+            for j in $(seq 1 $WAIT); do
+              if curl -fsS --max-time 2 "http://localhost:${PORT}${HEALTH}" > /dev/null 2>&1; then
+                echo "✅ [$NAME] ${j}sn sonra hazır"
+                READY=true; break
+              fi
+              sleep 1
+            done
+            if [ "$READY" != "true" ]; then
+              echo "⚠️ [$NAME] ${WAIT}sn'de yanıt vermedi. Log:"
+              tail -50 "logs-${NAME}.log" 2>/dev/null || true
+              echo "::warning::[$NAME] DAST hazırlık probe'u başarısız"
+            fi
+          done
+
+          # ---- Her component için ZAP scan ----
+          for i in $(seq 0 $((COUNT-1))); do
+            COMP=$(echo "$COMPONENTS" | jq -c ".[$i]")
+            NAME=$(echo "$COMP" | jq -r .name)
+            PORT=$(echo "$COMP" | jq -r .port)
+            URL="http://localhost:$PORT"
+
+            echo "🔍 [$NAME] ZAP scan: $URL"
+            docker run --rm --network=host \
+              -v "$PWD:/zap/wrk:rw" \
+              -t ghcr.io/zaproxy/zaproxy:stable \
+              zap-full-scan.py \
+              -t "$URL" \
+              -m 2 -T 3 -a -j \
+              -J "report_${NAME}.json" || true
+          done
+
+          # ---- Sonuçları birleştir ----
+          shopt -s nullglob
+          ZAP_FILES=(report_*.json)
+          if [ ${#ZAP_FILES[@]} -gt 0 ]; then
+            # Her file'a component name'i embed et
+            for f in "${ZAP_FILES[@]}"; do
+              NAME=$(basename "$f" .json | sed 's/^report_//')
+              jq --arg comp "$NAME" '.site[]? += {component: $comp} | .' "$f" > "${f}.tagged" && mv "${f}.tagged" "$f"
+            done
+            jq -s '{site: [.[].site[]?]}' "${ZAP_FILES[@]}" > zap.json
+          else
+            echo '{"site":[]}' > zap.json
+          fi
+          echo "Toplam $(jq '.site | length' zap.json) site, $(jq '[.site[]?.alerts[]?] | length' zap.json) alert"
 
       - name: ZAP raporu özetle
         if: always()
         run: |
           echo "## 🌐 DAST (ZAP Active)" >> $GITHUB_STEP_SUMMARY
-          echo "**Hedef:** ${{ needs.preflight.outputs.dast_target }}" >> $GITHUB_STEP_SUMMARY
-          if [ -f report_json.json ]; then
-            HIGH=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' report_json.json)
-            MED=$( jq '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' report_json.json)
-            LOW=$( jq '[.site[]?.alerts[]? | select(.riskcode=="1")] | length' report_json.json)
+          echo "**Component sayısı:** ${{ needs.preflight.outputs.components_count }}" >> $GITHUB_STEP_SUMMARY
+          [ -s zap.json ] || echo '{"site":[]}' > zap.json
+          HIGH=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' zap.json)
+          MED=$( jq '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' zap.json)
+          LOW=$( jq '[.site[]?.alerts[]? | select(.riskcode=="1")] | length' zap.json)
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Risk | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔴 High   | $HIGH |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟡 Medium | $MED  |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔵 Low    | $LOW  |" >> $GITHUB_STEP_SUMMARY
+          if [ $((HIGH + MED)) -gt 0 ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| Risk | Count |" >> $GITHUB_STEP_SUMMARY
-            echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-            echo "| 🔴 High   | $HIGH |" >> $GITHUB_STEP_SUMMARY
-            echo "| 🟡 Medium | $MED  |" >> $GITHUB_STEP_SUMMARY
-            echo "| 🔵 Low    | $LOW  |" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Tüm uyarılar (detaylı)" >> $GITHUB_STEP_SUMMARY
-            jq -r '.site[]?.alerts[]?
-              | "<details><summary>**\(.riskdesc)** — \(.name) (×\(.count))</summary>\n\n\((.desc // "n/a") | gsub("<[^>]+>"; "") | gsub("\n"; " "))\n\n**Çözüm:** \((.solution // "n/a") | gsub("<[^>]+>"; "") | gsub("\n"; " "))\n\n</details>\n"' \
-              report_json.json >> $GITHUB_STEP_SUMMARY
-            cp report_json.json zap.json
-          else
-            echo '{"site":[]}' > zap.json
-            echo "ZAP raporu üretilmedi." >> $GITHUB_STEP_SUMMARY
+            echo "### Uyarılar (component bazlı)" >> $GITHUB_STEP_SUMMARY
+            jq -r '.site[]? | "**Component: \(.component // "?")**\n" + (.alerts[]? | "<details><summary>**\(.riskdesc)** — \(.name) (×\(.count))</summary>\n\n\((.desc // "n/a") | gsub("<[^>]+>"; "") | gsub("\n"; " "))\n\n**Çözüm:** \((.solution // "n/a") | gsub("<[^>]+>"; "") | gsub("\n"; " "))\n\n</details>")' zap.json >> $GITHUB_STEP_SUMMARY
           fi
 
       - uses: actions/upload-artifact@v4
@@ -663,9 +750,12 @@ jobs:
           path: zap.json
           if-no-files-found: ignore
 
-      - name: Uygulamayı durdur
+      - uses: actions/upload-artifact@v4
         if: always()
-        run: docker ps -q | xargs -r docker stop || true
+        with:
+          name: dast-component-logs
+          path: logs-*.log
+          if-no-files-found: ignore
 
   # =====================================================================
   # 5b) DAST — Nuclei (kendi job'u, paralel)
@@ -715,54 +805,96 @@ jobs:
         if: steps.cache-nuclei-templates.outputs.cache-hit != 'true'
         run: nuclei -update-templates -silent 2>&1 | tail -5 || true
 
-      - name: Image build + start app
-        id: df
+      - name: Build image (varsa)
+        if: needs.preflight.outputs.has_dockerfile == 'true'
         run: |
           docker build \
             -f "${{ needs.preflight.outputs.dockerfile_path }}" \
             -t local/app:test \
             "${{ needs.preflight.outputs.dockerfile_dir }}"
-          ${{ needs.preflight.outputs.dast_start_command }}
-          TARGET="${{ needs.preflight.outputs.dast_target }}${{ needs.preflight.outputs.health_endpoint }}"
-          READY=false
-          for i in $(seq 1 ${{ inputs.dast_wait_seconds }}); do
-            if curl -fsS --max-time 2 "$TARGET" > /dev/null 2>&1; then
-              echo "✅ Uygulama ${i}sn sonra hazır ($TARGET)."
-              READY=true; break
-            fi
-            sleep 1
-          done
-          if [ "$READY" != "true" ]; then
-            docker ps -aq | head -1 | xargs -r docker logs 2>&1 | tail -50 || true
-            echo "::warning::App did not respond on $TARGET"
-          fi
-          echo "found=true" >> $GITHUB_OUTPUT
 
-      - name: Nuclei scan (rate-limited, CRITICAL+HIGH)
-        timeout-minutes: 7
+      - name: Start all components + Nuclei scan each
+        timeout-minutes: 12
         run: |
-          nuclei \
-            -u "${{ needs.preflight.outputs.dast_target }}" \
-            -tags cve,vulnerability,exposure,misconfiguration,default-logins \
-            -severity critical,high \
-            -rate-limit 50 \
-            -concurrency 10 \
-            -timeout 5 \
-            -retries 1 \
-            -no-interactsh \
-            -silent \
-            -jsonl -o nuclei.jsonl \
-            -stats 2>&1 | tail -30 || true
+          set +e
+          COMPONENTS='${{ needs.preflight.outputs.components_json }}'
+          COUNT=$(echo "$COMPONENTS" | jq 'length')
+          echo "🧩 $COUNT component Nuclei scan'i koşacak"
 
-          [ -s nuclei.jsonl ] || echo "" > nuclei.jsonl
-          jq -s '.' nuclei.jsonl > nuclei.json
-          echo "Bulgu sayısı: $(jq 'length' nuclei.json)"
+          declare -a BG_PIDS=()
+          cleanup() {
+            for pid in "${BG_PIDS[@]}"; do kill $pid 2>/dev/null || true; done
+            docker ps -q | xargs -r docker stop 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          # ---- Tüm component'leri başlat ----
+          for i in $(seq 0 $((COUNT-1))); do
+            COMP=$(echo "$COMPONENTS" | jq -c ".[$i]")
+            NAME=$(echo "$COMP" | jq -r .name)
+            PORT=$(echo "$COMP" | jq -r .port)
+            START=$(echo "$COMP" | jq -r .start)
+            HEALTH=$(echo "$COMP" | jq -r '.health // "/"')
+            WAIT=$(echo "$COMP" | jq -r '.wait_seconds // 30')
+
+            echo "▶ [$NAME] başlatılıyor (port $PORT): $START"
+            bash -c "$START" > "logs-${NAME}.log" 2>&1 &
+            BG_PIDS+=($!)
+
+            READY=false
+            for j in $(seq 1 $WAIT); do
+              if curl -fsS --max-time 2 "http://localhost:${PORT}${HEALTH}" > /dev/null 2>&1; then
+                echo "✅ [$NAME] ${j}sn sonra hazır"
+                READY=true; break
+              fi
+              sleep 1
+            done
+            if [ "$READY" != "true" ]; then
+              echo "⚠️ [$NAME] ${WAIT}sn'de yanıt vermedi"
+              tail -50 "logs-${NAME}.log" 2>/dev/null || true
+            fi
+          done
+
+          # ---- Her component için Nuclei scan ----
+          echo "[]" > nuclei.json
+          for i in $(seq 0 $((COUNT-1))); do
+            COMP=$(echo "$COMPONENTS" | jq -c ".[$i]")
+            NAME=$(echo "$COMP" | jq -r .name)
+            PORT=$(echo "$COMP" | jq -r .port)
+            URL="http://localhost:$PORT"
+
+            echo "🎯 [$NAME] Nuclei scan: $URL"
+            nuclei \
+              -u "$URL" \
+              -tags cve,vulnerability,exposure,misconfiguration,default-logins \
+              -severity critical,high \
+              -rate-limit 50 \
+              -concurrency 10 \
+              -timeout 5 \
+              -retries 1 \
+              -no-interactsh \
+              -silent \
+              -jsonl -o "nuclei-${NAME}.jsonl" \
+              -stats 2>&1 | tail -10 || true
+
+            # Her bulguya component name'i ekle
+            if [ -s "nuclei-${NAME}.jsonl" ]; then
+              jq -c --arg comp "$NAME" '. + {component: $comp}' "nuclei-${NAME}.jsonl" > "nuclei-${NAME}.tagged.jsonl"
+              cat "nuclei-${NAME}.tagged.jsonl" >> nuclei-all.jsonl
+            fi
+          done
+
+          # ---- Sonuçları birleştir ----
+          if [ -s nuclei-all.jsonl ]; then
+            jq -s '.' nuclei-all.jsonl > nuclei.json
+          fi
+          echo "Toplam $(jq 'length' nuclei.json) bulgu"
 
       - name: Nuclei raporu özetle
         if: always()
         run: |
           echo "## 🎯 DAST (Nuclei templates)" >> $GITHUB_STEP_SUMMARY
-          echo "**Hedef:** ${{ needs.preflight.outputs.dast_target }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Component sayısı:** ${{ needs.preflight.outputs.components_count }}" >> $GITHUB_STEP_SUMMARY
           [ -s nuclei.json ] || echo '[]' > nuclei.json
           CRIT=$(jq '[.[] | select(.info.severity=="critical")] | length' nuclei.json)
           HIGH=$(jq '[.[] | select(.info.severity=="high")]     | length' nuclei.json)
@@ -773,8 +905,8 @@ jobs:
           echo "| 🟠 High     | $HIGH |" >> $GITHUB_STEP_SUMMARY
           if [ $((CRIT + HIGH)) -gt 0 ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Bulgular" >> $GITHUB_STEP_SUMMARY
-            jq -r '.[] | "<details><summary>**\(.info.severity | ascii_upcase)** — \(.info.name) (\(.template-id // .templateID))</summary>\n\nURL: \(.matched-at // .url // "n/a")\n\n\((.info.description // "n/a") | gsub("\n"; " "))\n\n</details>\n"' nuclei.json >> $GITHUB_STEP_SUMMARY
+            echo "### Bulgular (component bazlı)" >> $GITHUB_STEP_SUMMARY
+            jq -r '.[] | "<details><summary>**\(.info.severity | ascii_upcase)** [\(.component // "?")] — \(.info.name)</summary>\n\nURL: \(.matched-at // .url // "n/a")\n\nTemplate: \(."template-id" // .templateID)\n\n\((.info.description // "n/a") | gsub("\n"; " "))\n\n</details>\n"' nuclei.json >> $GITHUB_STEP_SUMMARY
           fi
 
       - uses: actions/upload-artifact@v4
@@ -783,10 +915,6 @@ jobs:
           name: scan-nuclei
           path: nuclei.json
           if-no-files-found: ignore
-
-      - name: Uygulamayı durdur
-        if: always()
-        run: docker ps -q | xargs -r docker stop || true
 
   # =====================================================================
   # 6) VERDICT — GREEN/YELLOW/RED + Commit Status + DevOps response
