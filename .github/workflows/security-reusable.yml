@@ -67,6 +67,9 @@ jobs:
     outputs:
       project_type:      ${{ steps.detect.outputs.project_type }}
       has_dockerfile:    ${{ steps.detect.outputs.has_dockerfile }}
+      dockerfile_path:   ${{ steps.detect.outputs.dockerfile_path }}
+      dockerfile_dir:    ${{ steps.detect.outputs.dockerfile_dir }}
+      dockerfile_at_root: ${{ steps.detect.outputs.dockerfile_at_root }}
       has_lockfile:      ${{ steps.detect.outputs.has_lockfile }}
       has_appsec_yml:    ${{ steps.detect.outputs.has_appsec_yml }}
       port:              ${{ steps.detect.outputs.port }}
@@ -81,8 +84,49 @@ jobs:
         run: |
           set -e
 
-          # ---- Dosya tespiti ----
-          if [ -f Dockerfile ]; then DF=true; else DF=false; fi
+          # ---- Dockerfile tespiti (root-first + recursive fallback) ----
+          DF_PATH=""
+          DF_DIR=""
+          DF=false
+          DF_AT_ROOT=false
+          if [ -f Dockerfile ]; then
+            DF_PATH="Dockerfile"
+            DF_DIR="."
+            DF=true
+            DF_AT_ROOT=true
+            echo "✅ Dockerfile root'ta bulundu"
+          else
+            # Recursive ara — noise dizinleri hariç
+            DF_PATH=$(find . -name Dockerfile \
+              -not -path './node_modules/*' \
+              -not -path './.venv/*' \
+              -not -path './venv/*' \
+              -not -path './vendor/*' \
+              -not -path './.git/*' \
+              -not -path './dist/*' \
+              -not -path './build/*' \
+              -not -path './target/*' \
+              -not -path './bin/*' \
+              -not -path './obj/*' \
+              -not -path './test/*' \
+              -not -path './tests/*' \
+              -not -path './.next/*' \
+              -not -path './.nuxt/*' \
+              2>/dev/null | sort | head -1)
+            if [ -n "$DF_PATH" ]; then
+              DF_PATH="${DF_PATH#./}"
+              DF_DIR=$(dirname "$DF_PATH")
+              DF=true
+              DF_AT_ROOT=false
+              echo "::warning::Dockerfile root'ta değil, $DF_PATH bulundu. Standart: repo kökünde tek Dockerfile (standartlar.txt §3)."
+            else
+              DF_PATH=""
+              DF_DIR=""
+              DF=false
+              echo "::error::Dockerfile bulunamadı (recursive arama: node_modules/.venv/vendor/.git/dist/build/target/bin/obj/test hariç). Container scan + DAST atlanacak. Vibecoder Dockerfile commit etmeli (standartlar.txt §3)."
+            fi
+          fi
+
           if [ -f package-lock.json ] || [ -f yarn.lock ] || [ -f pnpm-lock.yaml ] || \
              [ -f poetry.lock ] || [ -f Pipfile.lock ] || [ -f go.sum ]; then
             LF=true
@@ -151,6 +195,9 @@ jobs:
           {
             echo "project_type=$PT"
             echo "has_dockerfile=$DF"
+            echo "dockerfile_path=$DF_PATH"
+            echo "dockerfile_dir=$DF_DIR"
+            echo "dockerfile_at_root=$DF_AT_ROOT"
             echo "has_lockfile=$LF"
             echo "has_appsec_yml=$AM"
             echo "port=$PORT"
@@ -168,6 +215,10 @@ jobs:
             echo "|---|---|"
             echo "| Project type     | \`$PT\` |"
             echo "| Has Dockerfile   | \`$DF\` |"
+            if [ "$DF" = "true" ]; then
+              echo "| Dockerfile path  | \`$DF_PATH\` |"
+              echo "| Dockerfile @root | \`$DF_AT_ROOT\` |"
+            fi
             echo "| Has lock file    | \`$LF\` |"
             echo "| Has .appsec.yml  | \`$AM\` |"
             echo "| Port             | \`$PORT\` |"
@@ -176,7 +227,9 @@ jobs:
             echo "| DAST target      | \`$TARGET\` |"
             echo ""
             if [ "$DF" = "false" ]; then
-              echo "⚠️  Dockerfile yok — Container scan ve DAST atlanacak."
+              echo "❌ **Dockerfile bulunamadı (recursive ile bile)** — Container scan ve DAST atlanacak. Vibecoder Dockerfile commit etmeli."
+            elif [ "$DF_AT_ROOT" = "false" ]; then
+              echo "⚠️  Dockerfile root'ta değil, \`$DF_PATH\` adresinde bulundu. Standart: repo kökünde Dockerfile (standartlar.txt §3). Yine de devam edildi."
             fi
             if [ "$LF" = "false" ] && [ "$PT" = "nodejs" ]; then
               echo "⚠️  package-lock.json yok — SCA için lockfile otomatik üretilecek (kayıp olabilir)."
@@ -483,8 +536,12 @@ jobs:
           restore-keys: |
             trivy-db-
 
-      - name: Build image
-        run: docker build -f Dockerfile -t local/app:scan .
+      - name: Build image (Dockerfile path from preflight)
+        run: |
+          docker build \
+            -f "${{ needs.preflight.outputs.dockerfile_path }}" \
+            -t local/app:scan \
+            "${{ needs.preflight.outputs.dockerfile_dir }}"
 
       - name: Trivy image scan (cached DB, unfixed dahil)
         id: df
@@ -544,7 +601,10 @@ jobs:
       - name: Image build + start app
         id: df
         run: |
-          docker build -f Dockerfile -t local/app:test .
+          docker build \
+            -f "${{ needs.preflight.outputs.dockerfile_path }}" \
+            -t local/app:test \
+            "${{ needs.preflight.outputs.dockerfile_dir }}"
           ${{ needs.preflight.outputs.dast_start_command }}
           TARGET="${{ needs.preflight.outputs.dast_target }}${{ needs.preflight.outputs.health_endpoint }}"
           READY=false
@@ -658,7 +718,10 @@ jobs:
       - name: Image build + start app
         id: df
         run: |
-          docker build -f Dockerfile -t local/app:test .
+          docker build \
+            -f "${{ needs.preflight.outputs.dockerfile_path }}" \
+            -t local/app:test \
+            "${{ needs.preflight.outputs.dockerfile_dir }}"
           ${{ needs.preflight.outputs.dast_start_command }}
           TARGET="${{ needs.preflight.outputs.dast_target }}${{ needs.preflight.outputs.health_endpoint }}"
           READY=false
