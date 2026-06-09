@@ -36,11 +36,13 @@ on:
         type: number
         default: 30
       critical_threshold:
+        description: 'Bu eşiğin üzerinde CRITICAL = RED. Banking varsayılan: 0 (sıfır tolerans)'
         type: number
         default: 0
       high_threshold:
+        description: 'Bu eşiğin üzerinde HIGH = YELLOW. Banking varsayılan: 0 (sıfır tolerans)'
         type: number
-        default: 5
+        default: 0
       soft_fail:
         type: boolean
         default: true
@@ -1004,18 +1006,22 @@ jobs:
           CTH=${{ inputs.critical_threshold }}
           HTH=${{ inputs.high_threshold }}
 
+          # Banking sıfır tolerans verdict mantığı:
+          # - Secret veya CRITICAL bulgu → RED (deploy blocked)
+          # - HIGH bulgu                  → YELLOW (review required, deploy stop)
+          # - Hepsi sıfır                 → GREEN (deploy OK)
           if [ "$SECRETS" -gt 0 ] || [ "$TOTAL_CRIT" -gt "$CTH" ]; then
             VERDICT="RED"
             DECISION="DEPLOY_BLOCKED"
-            REASON="Secret veya CRITICAL bulgu var; localde çalıştırmadan önce düzeltin."
+            REASON="Secret ($SECRETS) veya CRITICAL ($TOTAL_CRIT) bulgu var; deploy yasak. Tümünü kapatın."
           elif [ "$TOTAL_HIGH" -gt "$HTH" ]; then
             VERDICT="YELLOW"
             DECISION="REVIEW_REQUIRED"
-            REASON="HIGH bulgu eşik üstü; AppSec incelemesi sonrası deploy edin."
+            REASON="HIGH ($TOTAL_HIGH) bulgu var; GREEN için tümü kapatılmalı. AppSec onayı olmadan deploy etmeyin."
           else
             VERDICT="GREEN"
             DECISION="DEPLOY_OK"
-            REASON="Eşikler altında; kurum içi ortamda çalıştırılabilir."
+            REASON="CRITICAL ve HIGH bulgu yok, secret yok; deploy edilebilir."
           fi
 
           # Top findings — DevOps tek bakışta görsün
@@ -1118,9 +1124,9 @@ jobs:
           R="${{ steps.score.outputs.reason }}"
 
           case "$V" in
-            GREEN)  ICON="🟢"; BANNER="DEPLOY OK — Localde çalıştırabilirsiniz" ;;
-            YELLOW) ICON="🟡"; BANNER="REVIEW REQUIRED — AppSec onayı gerekli" ;;
-            RED)    ICON="🔴"; BANNER="DEPLOY BLOCKED — Düzeltmeden çalıştırmayın" ;;
+            GREEN)  ICON="🟢"; BANNER="DEPLOY OK — Tüm bulgular kapalı, deploy edilebilir" ;;
+            YELLOW) ICON="🟡"; BANNER="DEPLOY STOP — HIGH bulgular kapatılmalı, AppSec onayı gerekli" ;;
+            RED)    ICON="🔴"; BANNER="DEPLOY BLOCKED — Secret/CRITICAL var, deploy yasak" ;;
           esac
 
           {
@@ -1185,9 +1191,9 @@ jobs:
             const v = "${{ steps.score.outputs.verdict }}";
             const d = "${{ steps.score.outputs.decision }}";
             const reason = `${{ steps.score.outputs.reason }}`;
-            const state = v === "GREEN" ? "success"
-                        : v === "YELLOW" ? "success"  // not "failure" ki PR akışını bloklamasın; karar DevOps'ta
-                        : "failure";
+            // Banking sıfır tolerans: sadece GREEN deploy'a izin verir.
+            // YELLOW ve RED — commit status FAILURE, branch protection ile merge blok.
+            const state = v === "GREEN" ? "success" : "failure";
             const description = `${v} — ${d} — ${reason}`.slice(0, 140);
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,

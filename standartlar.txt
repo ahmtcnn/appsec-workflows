@@ -268,11 +268,20 @@ Her push'ta otomatik koşan job'lar:
                      (rate-limit: 50 req/sn, app'i yormaz)
   7. Verdict       → GREEN / YELLOW / RED kararı
 
-VERDICT MANTIĞI:
+VERDICT MANTIĞI (BANKING SIFIR TOLERANS):
 
-  RED     → CRITICAL bulgu veya hardcoded secret var. Deploy YASAK.
-  YELLOW  → HIGH bulgu eşik (5) üstünde. AppSec onayı gerekli.
-  GREEN   → Eşikler altında. Deploy edilebilir.
+  RED     → CRITICAL bulgu veya hardcoded secret var.
+            Deploy YASAK. Tümünü kapat.
+
+  YELLOW  → HIGH bulgu var (hangi tarama olursa olsun: SAST, SCA,
+            container, DAST, Nuclei). GREEN için tümü kapatılmalı.
+            AppSec onayı olmadan deploy etmeyin.
+
+  GREEN   → Hiçbir CRITICAL, HIGH ve secret yok. Deploy OK.
+
+NOT: Eskiden HIGH için "5 ve altı" GREEN'di. Yeni kural sıfır
+tolerans — tek bir HIGH bile YELLOW yapar. Banking'de bu
+gerekli çünkü 1 SQL injection bile yeterli zarar verir.
 
 EKSIK DURUM:
 
